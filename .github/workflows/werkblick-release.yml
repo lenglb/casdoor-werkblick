@@ -1,0 +1,192 @@
+name: Publish Werkblick Casdoor image
+
+on:
+  push:
+    tags:
+      - "werkblick-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: werkblick-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/lenglb/casdoor-werkblick
+  EXPECTED_REPOSITORY: lenglb/casdoor-werkblick
+
+jobs:
+  ci:
+    name: Required build and tests
+    if: github.repository == 'lenglb/casdoor-werkblick'
+    uses: ./.github/workflows/werkblick-ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish, attest, and sign
+    if: github.repository == 'lenglb/casdoor-werkblick'
+    needs: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: ghcr-production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate protected release tag
+        id: release
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REPOSITORY" != "$EXPECTED_REPOSITORY" ]]; then
+            echo "::error::Release repository must be $EXPECTED_REPOSITORY"
+            exit 1
+          fi
+          if [[ ! "$GITHUB_REF_NAME" =~ ^werkblick-v[0-9]+\.[0-9]+\.[0-9]+-r[0-9]+$ ]]; then
+            echo "::error::Expected tag werkblick-v<major>.<minor>.<patch>-r<revision>"
+            exit 1
+          fi
+          if [[ "$REF_PROTECTED" != "true" ]]; then
+            echo "::error::Release tags must be covered by a GitHub ruleset"
+            exit 1
+          fi
+
+          release_commit=$(git rev-list -n 1 "$GITHUB_REF")
+          if ! git merge-base --is-ancestor "$release_commit" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::Release commit is not contained in $DEFAULT_BRANCH"
+            exit 1
+          fi
+
+          version=${GITHUB_REF_NAME#werkblick-v}
+          epoch=$(git show -s --format=%ct "$release_commit")
+          created=$(git show -s --format=%cI "$release_commit")
+
+          {
+            echo "commit=$release_commit"
+            echo "version=$version"
+            echo "epoch=$epoch"
+            echo "created=$created"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Provenance and SBOMs are attached after the build. Keeping them out of
+      # the image index preserves a stable image digest for identical source.
+      - name: Build and push immutable multi-architecture image
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.werkblick
+          platforms: linux/amd64,linux/arm64
+          push: true
+          pull: true
+          provenance: false
+          sbom: false
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.release.outputs.version }}
+            ${{ env.IMAGE }}:sha-${{ steps.release.outputs.commit }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.release.outputs.created }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.commit }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.release.outputs.version }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.release.outputs.epoch }}
+          cache-from: type=gha,scope=werkblick-release-image
+          cache-to: type=gha,mode=max,scope=werkblick-release-image
+
+      - name: Generate SPDX SBOM from published digest
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          syft-version: v1.46.0
+          dependency-snapshot: false
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.0.6
+
+      - name: Keyless-sign image and attach signed SBOM
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$IMAGE@$DIGEST"
+          cosign sign --yes "$image_ref"
+          cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$image_ref"
+
+      - name: Publish GitHub build provenance
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Verify keyless image signature and SBOM attestation
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$IMAGE@$DIGEST"
+          certificate_identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/werkblick-release.yml@$GITHUB_REF"
+          issuer="https://token.actions.githubusercontent.com"
+
+          cosign verify \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$image_ref"
+          cosign verify-attestation \
+            --type spdxjson \
+            --certificate-identity "$certificate_identity" \
+            --certificate-oidc-issuer "$issuer" \
+            "$image_ref"
+
+      - name: Write digest-pinned release summary
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          VERSION: ${{ steps.release.outputs.version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        shell: bash
+        run: |
+          {
+            echo "## Werkblick Casdoor image"
+            echo
+            echo "- Version tag: \`$IMAGE:$VERSION\`"
+            echo "- Source tag: \`$IMAGE:sha-$COMMIT\`"
+            echo "- Deploy only: \`$IMAGE@$DIGEST\`"
+            echo "- SBOM: signed SPDX JSON registry attestation"
+            echo "- Provenance: GitHub artifact attestation"
+          } >> "$GITHUB_STEP_SUMMARY"

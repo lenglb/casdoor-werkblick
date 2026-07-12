@@ -283,6 +283,46 @@ func CheckPassword(user *User, password string, lang string, options ...bool) er
 	return resetUserSigninErrorTimes(user)
 }
 
+// GetVerifiedPasswordAuthenticationMethods classifies a password
+// authentication after CheckUserPassword has succeeded. It distinguishes
+// ordinary and LDAP passwords from the organization-wide master password so
+// callers cannot accidentally assert "pwd" for administrative bypass
+// credentials.
+func GetVerifiedPasswordAuthenticationMethods(user *User, password string) ([]string, error) {
+	if user == nil {
+		return nil, fmt.Errorf("verified password user must not be nil")
+	}
+
+	if user.Ldap != "" {
+		return []string{"pwd", "ldap"}, nil
+	}
+
+	organization, err := GetOrganizationByUser(user)
+	if err != nil {
+		return nil, err
+	}
+	if organization == nil {
+		return nil, fmt.Errorf("organization does not exist")
+	}
+
+	passwordType := user.PasswordType
+	if passwordType == "" {
+		passwordType = organization.PasswordType
+	}
+	credManager := cred.GetCredManager(passwordType)
+	if credManager == nil {
+		return nil, fmt.Errorf("unsupported password type: %s", passwordType)
+	}
+
+	if organization.MasterPassword != "" &&
+		(password == organization.MasterPassword ||
+			credManager.IsPasswordCorrect(password, organization.MasterPassword, organization.PasswordSalt)) {
+		return []string{"master_password"}, nil
+	}
+
+	return []string{"pwd"}, nil
+}
+
 func CheckPasswordComplexityByOrg(organization *Organization, password string, lang string) string {
 	errorMsg := checkPasswordComplexity(password, organization.PasswordOptions, lang)
 	return errorMsg

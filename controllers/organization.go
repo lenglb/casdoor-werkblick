@@ -138,6 +138,10 @@ func (c *ApiController) UpdateOrganization() {
 		c.ResponseError(err.Error())
 		return
 	}
+	if err = object.ValidateHardenedMfaItems(organization.MfaItems); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 
 	isGlobalAdmin, _ := c.isGlobalAdmin()
 
@@ -176,6 +180,10 @@ func (c *ApiController) AddOrganization() {
 	}
 
 	if err = object.CheckIpWhitelist(organization.IpWhitelist, c.GetAcceptLanguage()); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if err = object.ValidateHardenedMfaItems(organization.MfaItems); err != nil {
 		c.ResponseError(err.Error())
 		return
 	}
@@ -241,6 +249,10 @@ func (c *ApiController) GetDefaultApplication() {
 	}
 
 	application = object.GetMaskedApplication(application, userId)
+	if err = c.attachProviderStates(application); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 	c.ResponseOk(application)
 }
 

@@ -465,6 +465,9 @@ class App extends Component {
         if (res.status === "ok") {
           account = res.data;
           account.organization = res.data2;
+          if (res.data3?.mode === "mfa_setup" && typeof res.data3.applicationId === "string") {
+            account.mfaSetupApplicationId = res.data3.applicationId;
+          }
           accessToken = res.data.accessToken;
 
           if (!localStorage.getItem("language")) {

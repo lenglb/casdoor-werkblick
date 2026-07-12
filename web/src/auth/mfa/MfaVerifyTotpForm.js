@@ -1,5 +1,5 @@
 import {CopyOutlined} from "@ant-design/icons";
-import {Button, Checkbox, Col, Form, Input, QRCode, Space} from "antd";
+import {Button, Col, Form, Input, QRCode, Space} from "antd";
 import copy from "copy-to-clipboard";
 import i18next from "i18next";
 import React from "react";
@@ -41,9 +41,6 @@ export const MfaVerifyTotpForm = ({mfaProps, onFinish}) => {
       form={form}
       style={{width: "300px", margin: "0 auto"}}
       onFinish={onFinish}
-      initialValues={{
-        enableMfaRemember: false,
-      }}
     >
       {renderSecret()}
       <Form.Item
@@ -56,14 +53,6 @@ export const MfaVerifyTotpForm = ({mfaProps, onFinish}) => {
             form.submit();
           }}
         />
-      </Form.Item>
-      <Form.Item
-        name="enableMfaRemember"
-        valuePropName="checked"
-      >
-        <Checkbox>
-          {i18next.t("mfa:Remember this account for {hour} hours").replace("{hour}", mfaProps?.mfaRememberInHours)}
-        </Checkbox>
       </Form.Item>
       <Form.Item>
         <Button

@@ -31,18 +31,41 @@ export const RadiusMfaType = "radius";
 export const PushMfaType = "push";
 export const RecoveryMfaType = "recovery";
 
+const blockedMfaRedirectProtocols = new Set(["about:", "blob:", "data:", "file:", "javascript:", "vbscript:"]);
+
+export function getSafeMfaRedirectUrl(redirectUrl, baseUrl = window.location.origin) {
+  if (typeof redirectUrl !== "string" || redirectUrl.trim() === "") {
+    return null;
+  }
+
+  try {
+    const target = new URL(redirectUrl, baseUrl);
+    if (blockedMfaRedirectProtocols.has(target.protocol.toLowerCase())) {
+      return null;
+    }
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
 class MfaSetupPage extends React.Component {
   constructor(props) {
     super(props);
     const params = new URLSearchParams(props.location.search);
     const {location} = this.props;
+    const boundApplicationId = props.account.mfaSetupApplicationId || "";
+    const applicationIdParts = boundApplicationId.split("/");
+    const hasBoundApplication = applicationIdParts.length === 2 && applicationIdParts.every(Boolean);
     this.state = {
       account: props.account,
       application: null,
-      applicationName: props.account.signupApplication ?? localStorage.getItem("applicationName") ?? "",
+      applicationOwner: hasBoundApplication ? applicationIdParts[0] : "admin",
+      applicationName: hasBoundApplication ? applicationIdParts[1] : (props.account.signupApplication || localStorage.getItem("applicationName") || ""),
+      boundApplicationId: hasBoundApplication ? boundApplicationId : "",
       current: location.state?.from !== undefined ? 1 : 0,
       mfaProps: null,
-      mfaType: params.get("mfaType") ?? SmsMfaType,
+      mfaType: params.get("mfaType") ?? TotpMfaType,
       isPromptPage: props.isPromptPage || location.state?.from !== undefined,
       loading: false,
     };
@@ -62,6 +85,18 @@ class MfaSetupPage extends React.Component {
   }
 
   componentDidUpdate(prevProps, prevState, snapshot) {
+    if (this.props.location.search !== prevProps.location.search) {
+      const requestedMfaType = new URLSearchParams(this.props.location.search).get("mfaType");
+      if (requestedMfaType && requestedMfaType !== this.state.mfaType) {
+        this.setState({
+          mfaType: requestedMfaType,
+          mfaProps: null,
+          loading: this.state.current === 1,
+        });
+        return;
+      }
+    }
+
     if (this.state.mfaType !== prevState.mfaType || this.state.current !== prevState.current) {
       if (this.state.current === 1) {
         this.initMfaProps();
@@ -70,7 +105,7 @@ class MfaSetupPage extends React.Component {
   }
 
   getApplication() {
-    ApplicationBackend.getApplication("admin", this.state.applicationName)
+    ApplicationBackend.getApplication(this.state.applicationOwner, this.state.applicationName)
       .then((res) => {
         if (res !== null) {
           if (res.status === "error") {
@@ -78,7 +113,10 @@ class MfaSetupPage extends React.Component {
             return;
           }
           this.setState({
-            application: res.data,
+            application: this.state.boundApplicationId ? {
+              ...res.data,
+              mfaSetupApplicationId: this.state.boundApplicationId,
+            } : res.data,
           });
         } else {
           Setting.showMessage("error", i18next.t("general:Failed to get"));
@@ -106,86 +144,85 @@ class MfaSetupPage extends React.Component {
     return this.props.account;
   }
 
+  navigateToMfaRedirect(redirectUrl) {
+    const safeRedirectUrl = getSafeMfaRedirectUrl(redirectUrl);
+    if (safeRedirectUrl === null) {
+      Setting.showMessage("error", "Invalid MFA redirect URL");
+      return false;
+    }
+
+    localStorage.removeItem("mfaRedirectUrl");
+    this.props.onfinish?.();
+    Setting.goToLink(safeRedirectUrl);
+    return true;
+  }
+
+  finishMfaSetup(useStoredRedirect) {
+    const storedRedirectUrl = localStorage.getItem("mfaRedirectUrl");
+    localStorage.removeItem("mfaRedirectUrl");
+    this.props.onfinish?.();
+
+    if (useStoredRedirect && storedRedirectUrl) {
+      const safeRedirectUrl = getSafeMfaRedirectUrl(storedRedirectUrl);
+      if (safeRedirectUrl !== null) {
+        Setting.goToLink(safeRedirectUrl);
+        return;
+      }
+      Setting.showMessage("error", "Invalid MFA redirect URL");
+    }
+
+    if (useStoredRedirect) {
+      this.props.history.push("/account");
+    } else {
+      this.props.history.replace("/account");
+    }
+  }
+
+  handleMfaSetupCompletion(completion) {
+    Setting.showMessage("success", i18next.t("general:Enabled successfully"));
+
+    if (completion.responseMode === "form_post" && completion.redirectUri && completion.code) {
+      const safeRedirectUrl = getSafeMfaRedirectUrl(completion.redirectUri);
+      if (safeRedirectUrl === null) {
+        Setting.showMessage("error", "Invalid MFA redirect URL");
+        return;
+      }
+      localStorage.removeItem("mfaRedirectUrl");
+      this.props.onfinish?.();
+      Setting.createFormAndSubmit(safeRedirectUrl, {
+        code: completion.code,
+        state: completion.state,
+      });
+      return;
+    }
+
+    if (completion.redirectUrl) {
+      this.navigateToMfaRedirect(completion.redirectUrl);
+      return;
+    }
+
+    switch (completion.type) {
+    case "mfa_setup_required":
+      // Reloading refreshes the restricted account. App then selects the next
+      // still-required factor and updates this route's mfaType.
+      window.location.reload();
+      return;
+    case "complete":
+    case "device":
+      this.finishMfaSetup(false);
+      return;
+    case "consent":
+    case "oauth_code":
+      Setting.showMessage("error", "MFA completion redirect is missing");
+      return;
+    default:
+      // Legacy self-service and admin responses contain no typed completion.
+      this.finishMfaSetup(true);
+    }
+  }
+
   renderMfaTypeSwitch() {
-    const renderSmsLink = () => {
-      if (this.state.mfaType === SmsMfaType) {
-        return null;
-      }
-      return (<Button type={"link"} onClick={() => {
-        this.setState({
-          mfaType: SmsMfaType,
-        });
-        this.props.history.push(`/mfa/setup?mfaType=${SmsMfaType}`);
-      }
-      }>{i18next.t("mfa:Use SMS")}</Button>
-      );
-    };
-
-    const renderEmailLink = () => {
-      if (this.state.mfaType === EmailMfaType) {
-        return null;
-      }
-      return (<Button type={"link"} onClick={() => {
-        this.setState({
-          mfaType: EmailMfaType,
-        });
-        this.props.history.push(`/mfa/setup?mfaType=${EmailMfaType}`);
-      }
-      }>{i18next.t("mfa:Use Email")}</Button>
-      );
-    };
-
-    const renderTotpLink = () => {
-      if (this.state.mfaType === TotpMfaType) {
-        return null;
-      }
-      return (<Button type={"link"} onClick={() => {
-        this.setState({
-          mfaType: TotpMfaType,
-        });
-        this.props.history.push(`/mfa/setup?mfaType=${TotpMfaType}`);
-      }
-      }>{i18next.t("mfa:Use Authenticator App")}</Button>
-      );
-    };
-
-    const renderRadiusLink = () => {
-      if (this.state.mfaType === RadiusMfaType) {
-        return null;
-      }
-      return (<Button type={"link"} onClick={() => {
-        this.setState({
-          mfaType: RadiusMfaType,
-        });
-        this.props.history.push(`/mfa/setup?mfaType=${RadiusMfaType}`);
-      }
-      }>{i18next.t("mfa:Use Radius")}</Button>
-      );
-    };
-
-    const renderPushLink = () => {
-      if (this.state.mfaType === PushMfaType) {
-        return null;
-      }
-      return (<Button type={"link"} onClick={() => {
-        this.setState({
-          mfaType: PushMfaType,
-        });
-        this.props.history.push(`/mfa/setup?mfaType=${PushMfaType}`);
-      }
-      }>{i18next.t("mfa:Use Push Notification")}</Button>
-      );
-    };
-
-    return !this.state.isPromptPage ? (
-      <React.Fragment>
-        {renderSmsLink()}
-        {renderEmailLink()}
-        {renderTotpLink()}
-        {renderRadiusLink()}
-        {renderPushLink()}
-      </React.Fragment>
-    ) : null;
+    return null;
   }
 
   renderStep() {
@@ -230,17 +267,8 @@ class MfaSetupPage extends React.Component {
     case 2:
       return (
         <MfaEnableForm user={this.getUser()} mfaType={this.state.mfaType} secret={this.state.mfaProps.secret} recoveryCodes={this.state.mfaProps.recoveryCodes} dest={this.state.dest} countryCode={this.state.countryCode}
-          onSuccess={() => {
-            Setting.showMessage("success", i18next.t("general:Enabled successfully"));
-            this.props.onfinish();
-
-            const mfaRedirectUrl = localStorage.getItem("mfaRedirectUrl");
-            if (mfaRedirectUrl !== undefined && mfaRedirectUrl !== null) {
-              Setting.goToLink(localStorage.getItem("mfaRedirectUrl"));
-              localStorage.removeItem("mfaRedirectUrl");
-            } else {
-              this.props.history.push("/account");
-            }
+          onSuccess={(res, completion) => {
+            this.handleMfaSetupCompletion(completion);
           }}
           onFail={(res) => {
             Setting.showMessage("error", `${i18next.t("general:Failed to enable")}: ${res.msg}`);

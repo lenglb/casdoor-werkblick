@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -49,6 +50,113 @@ type ObjectWithOrg struct {
 	Organization string `json:"organization"`
 }
 
+// restrictedMfaSetupSession is the only identity available while a user who
+// has successfully completed primary authentication is required to enroll an
+// MFA method. It deliberately does not become the request subject: the setup
+// session may only pass the small allowlist enforced below.
+type restrictedMfaSetupSession struct {
+	UserId    string
+	UserOwner string
+	UserName  string
+	Pending   object.PendingAuthentication
+}
+
+func isRestrictedMfaSetupSessionActive(setupValue, usernameValue interface{}) bool {
+	if setupValue == nil {
+		return false
+	}
+	username, ok := usernameValue.(string)
+	return !ok || strings.TrimSpace(username) == ""
+}
+
+func parseRestrictedMfaSetupSession(setupValue, pendingValue interface{}) (restrictedMfaSetupSession, error) {
+	userId, ok := setupValue.(string)
+	if !ok || strings.TrimSpace(userId) == "" || strings.TrimSpace(userId) != userId {
+		return restrictedMfaSetupSession{}, fmt.Errorf("MFA setup session user is invalid")
+	}
+	userOwner, userName, err := util.GetOwnerAndNameFromIdWithError(userId)
+	if err != nil || userOwner == "" || userName == "" {
+		return restrictedMfaSetupSession{}, fmt.Errorf("MFA setup session user is invalid")
+	}
+
+	serialized, ok := pendingValue.(string)
+	if !ok || strings.TrimSpace(serialized) == "" {
+		return restrictedMfaSetupSession{}, fmt.Errorf("pending authentication is missing")
+	}
+	var pending object.PendingAuthentication
+	if err = util.JsonToStruct(serialized, &pending); err != nil {
+		return restrictedMfaSetupSession{}, fmt.Errorf("decode pending authentication: %w", err)
+	}
+	pending, err = pending.Preserve()
+	if err != nil {
+		return restrictedMfaSetupSession{}, fmt.Errorf("validate pending authentication: %w", err)
+	}
+	if pending.Context.Subject != userId {
+		return restrictedMfaSetupSession{}, fmt.Errorf("pending authentication does not match the MFA setup user")
+	}
+	applicationOwner, applicationName, err := util.GetOwnerAndNameFromIdWithError(pending.ApplicationId)
+	if err != nil || applicationOwner == "" || applicationName == "" {
+		return restrictedMfaSetupSession{}, fmt.Errorf("pending authentication application is invalid")
+	}
+
+	return restrictedMfaSetupSession{
+		UserId:    userId,
+		UserOwner: userOwner,
+		UserName:  userName,
+		Pending:   pending,
+	}, nil
+}
+
+// getRestrictedMfaSetupSession returns active=true as soon as the restricted
+// setup marker exists without a normal username session. Any malformed,
+// missing, mismatched, or expired pending state is returned as an error so the
+// request fails closed instead of falling back to anonymous public policies.
+func getRestrictedMfaSetupSession(ctx *context.Context) (session restrictedMfaSetupSession, active bool, err error) {
+	setupValue := ctx.Input.CruSession.Get(stdcontext.Background(), object.MfaSetupSessionUserId)
+	usernameValue := ctx.Input.CruSession.Get(stdcontext.Background(), "username")
+	if !isRestrictedMfaSetupSessionActive(setupValue, usernameValue) {
+		return restrictedMfaSetupSession{}, false, nil
+	}
+
+	pendingValue := ctx.Input.CruSession.Get(stdcontext.Background(), object.PendingAuthenticationSessionKey)
+	session, err = parseRestrictedMfaSetupSession(setupValue, pendingValue)
+	return session, true, err
+}
+
+func parsePostForm(ctx *context.Context) (url.Values, error) {
+	contentType := ctx.Request.Header.Get("Content-Type")
+	var err error
+	if strings.Contains(contentType, "multipart/form-data") {
+		err = ctx.Request.ParseMultipartForm(32 << 20)
+	} else {
+		err = ctx.Request.ParseForm()
+	}
+	if err != nil {
+		return nil, err
+	}
+	return ctx.Request.PostForm, nil
+}
+
+func isRestrictedMfaSetupRequestAllowed(ctx *context.Context, session restrictedMfaSetupSession, method, urlPath string) bool {
+	switch {
+	case method == http.MethodGet && urlPath == "/api/get-account":
+		return true
+	case method == http.MethodGet && urlPath == "/api/get-application":
+		return ctx.Input.Query("id") == session.Pending.ApplicationId
+	case method == http.MethodPost && (urlPath == "/api/mfa/setup/initiate" ||
+		urlPath == "/api/mfa/setup/verify" || urlPath == "/api/mfa/setup/enable"):
+		form, err := parsePostForm(ctx)
+		return err == nil && form.Get("owner") == session.UserOwner && form.Get("name") == session.UserName
+	case method == http.MethodPost && urlPath == "/api/send-verification-code":
+		form, err := parsePostForm(ctx)
+		return err == nil && form.Get("method") == "mfaSetup" &&
+			form.Get("checkUser") == session.UserName &&
+			form.Get("applicationId") == session.Pending.ApplicationId
+	default:
+		return false
+	}
+}
+
 // ownerNameFromForm parses form or multipart body for authorization checks when the
 // request is not JSON (e.g. MFA APIs use FormData). RequestBodyFilter caches the raw
 // body but leaves Request.Body restorable for ParseForm/ParseMultipartForm.
@@ -72,6 +180,15 @@ func checkIsOrgOwnerObject(urlPath string) bool {
 }
 
 func getUsername(ctx *context.Context) (username string) {
+	// Bearer and DPoP identities are intentionally request-scoped. They must be
+	// visible to authorization without ever being promoted into a reusable
+	// browser session.
+	if value := ctx.Input.GetData("tokenAuthenticatedUserId"); value != nil {
+		if requestUsername, ok := value.(string); ok && requestUsername != "" {
+			return requestUsername
+		}
+	}
+
 	username, ok := ctx.Input.Session("username").(string)
 	if !ok || username == "" {
 		username, _ = getUsernameByClientIdSecret(ctx)
@@ -328,7 +445,11 @@ func getImpersonateUser(ctx *context.Context, subOwner, subName, username string
 }
 
 func ApiFilter(ctx *context.Context) {
-	subOwner, subName := getSubject(ctx)
+	restrictedMfaSetup, restrictedMfaSetupActive, restrictedMfaSetupErr := getRestrictedMfaSetupSession(ctx)
+	subOwner, subName := "anonymous", "anonymous"
+	if !restrictedMfaSetupActive {
+		subOwner, subName = getSubject(ctx)
+	}
 	// stash current user info into request context for controllers
 	username := ""
 	if !(subOwner == "anonymous" && subName == "anonymous") {
@@ -355,10 +476,25 @@ func ApiFilter(ctx *context.Context) {
 		urlPath = "/api/notify-payment"
 	}
 
-	isAllowed, err := authz.IsAllowed(subOwner, subName, method, urlPath, objOwner, objName, extraInfo)
-	if err != nil {
-		responseError(ctx, err.Error())
-		return
+	isAllowed := false
+	if restrictedMfaSetupActive {
+		// Logout is the recovery path for expired, malformed or partially
+		// completed setup transactions. It deliberately remains available even
+		// when the pending state can no longer be parsed.
+		if urlPath == "/api/logout" && (method == http.MethodPost || method == http.MethodGet) {
+			isAllowed = true
+		} else if restrictedMfaSetupErr != nil {
+			logs.Warning("Restricted MFA setup request denied: %s", restrictedMfaSetupErr)
+		} else {
+			isAllowed = isRestrictedMfaSetupRequestAllowed(ctx, restrictedMfaSetup, method, urlPath)
+		}
+	} else {
+		var err error
+		isAllowed, err = authz.IsAllowed(subOwner, subName, method, urlPath, objOwner, objName, extraInfo)
+		if err != nil {
+			responseError(ctx, err.Error())
+			return
+		}
 	}
 
 	if method != "GET" && !strings.HasSuffix(urlPath, "-entry") {

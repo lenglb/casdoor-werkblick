@@ -444,11 +444,16 @@ export function getAuthUrl(application, provider, method, code) {
   }
   const isTelegramOIDC = provider.type === "Telegram" || (provider.type === "Custom" && provider.customAuthUrl && provider.customAuthUrl.includes("oauth.telegram.org"));
   const isShortState = (provider.type === "WeChat" && navigator.userAgent.includes("MicroMessenger") && provider.clientId2) || (provider.type === "Twitter") || isTelegramOIDC;
+  const normalizedMethod = method || "signup";
+  const providerState = application.providerStates?.[`${provider.name}:${normalizedMethod}`];
+  if (!providerState) {
+    return "#";
+  }
   let applicationName = application.name;
   if (application?.isShared) {
     applicationName = `${application.name}-org-${application.organization}`;
   }
-  const state = Util.getStateFromQueryParams(applicationName, provider.name, method, isShortState);
+  const state = Util.getStateFromQueryParams(providerState, applicationName, provider.name, normalizedMethod, isShortState);
 
   // Generate PKCE code verifier and challenge dynamically
   const codeVerifier = generateCodeVerifier();
@@ -564,9 +569,9 @@ export function getAuthUrl(application, provider, method, code) {
   } else if (provider.type === "Bilibili") {
     return `${endpoint}#/?client_id=${provider.clientId}&return_url=${redirectUri}&state=${state}&response_type=code`;
   } else if (provider.type === "Deezer") {
-    return `${endpoint}?app_id=${provider.clientId}&redirect_uri=${redirectUri}&perms=${scope}`;
+    return `${endpoint}?app_id=${provider.clientId}&redirect_uri=${redirectUri}&perms=${scope}&state=${encodeURIComponent(state)}`;
   } else if (provider.type === "Lastfm") {
-    return `${endpoint}?api_key=${provider.clientId}&cb=${redirectUri}`;
+    return `${endpoint}?api_key=${provider.clientId}&cb=${encodeURIComponent(Util.addSearchParamsToUrl(redirectUri, {state: state}))}`;
   } else if (provider.type === "Shopify") {
     return `${endpoint}?client_id=${provider.clientId}&redirect_uri=${redirectUri}&scope=${scope}&state=${state}&grant_options[]=per-user`;
   } else if (provider.type === "Twitter" || provider.type === "Fitbit") {

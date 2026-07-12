@@ -16,6 +16,7 @@ package object
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/casdoor/casdoor/util"
@@ -24,16 +25,20 @@ import (
 
 type ClaimsStandard struct {
 	*UserStandard
-	EmailVerified       bool        `json:"email_verified,omitempty"`
-	PhoneNumber         string      `json:"phone_number,omitempty"`
-	PhoneNumberVerified bool        `json:"phone_number_verified,omitempty"`
-	Gender              string      `json:"gender,omitempty"`
-	TokenType           string      `json:"tokenType,omitempty"`
-	Nonce               string      `json:"nonce,omitempty"`
-	Scope               string      `json:"scope,omitempty"`
-	Address             OIDCAddress `json:"address,omitempty"`
-	Azp                 string      `json:"azp,omitempty"`
-	Provider            string      `json:"provider,omitempty"`
+	EmailVerified         bool              `json:"email_verified,omitempty"`
+	PhoneNumber           string            `json:"phone_number,omitempty"`
+	PhoneNumberVerified   bool              `json:"phone_number_verified,omitempty"`
+	Gender                string            `json:"gender,omitempty"`
+	TokenType             string            `json:"tokenType,omitempty"`
+	Nonce                 string            `json:"nonce,omitempty"`
+	Scope                 string            `json:"scope,omitempty"`
+	Address               OIDCAddress       `json:"address,omitempty"`
+	Azp                   string            `json:"azp,omitempty"`
+	Provider              string            `json:"provider,omitempty"`
+	AuthenticationMethods []string          `json:"amr,omitempty"`
+	AuthTime              int64             `json:"auth_time,omitempty"`
+	Acr                   string            `json:"acr,omitempty"`
+	Cnf                   *DPoPConfirmation `json:"cnf,omitempty"`
 
 	jwt.RegisteredClaims
 }
@@ -48,14 +53,18 @@ func getStreetAddress(user *User) string {
 
 func getStandardClaims(claims Claims) ClaimsStandard {
 	res := ClaimsStandard{
-		UserStandard:     getStandardUser(claims.User),
-		EmailVerified:    claims.User.EmailVerified,
-		TokenType:        claims.TokenType,
-		Nonce:            claims.Nonce,
-		Scope:            claims.Scope,
-		RegisteredClaims: claims.RegisteredClaims,
-		Azp:              claims.Azp,
-		Provider:         claims.Provider,
+		UserStandard:          getStandardUser(claims.User),
+		EmailVerified:         claims.User.EmailVerified,
+		TokenType:             claims.TokenType,
+		Nonce:                 claims.Nonce,
+		Scope:                 claims.Scope,
+		RegisteredClaims:      claims.RegisteredClaims,
+		Azp:                   claims.Azp,
+		Provider:              claims.Provider,
+		AuthenticationMethods: slices.Clone(claims.AuthenticationMethods),
+		AuthTime:              claims.AuthTime,
+		Acr:                   claims.Acr,
+		Cnf:                   cloneDPoPConfirmation(claims.Cnf),
 	}
 
 	res.Phone = ""

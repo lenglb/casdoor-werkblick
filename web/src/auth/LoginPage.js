@@ -119,7 +119,7 @@ class LoginPage extends React.Component {
       if (this.props.account && this.props.account.owner === this.props.application?.organization) {
         const params = new URLSearchParams(this.props.location.search);
         const silentSignin = params.get("silentSignin");
-        if (silentSignin !== null) {
+        if (silentSignin !== null && !this.requiresExplicitSignin()) {
           this.sendSilentSigninData("signing-in");
 
           const values = {};
@@ -133,13 +133,17 @@ class LoginPage extends React.Component {
           });
         }
 
-        if (this.props.application.enableAutoSignin && silentSignin === null) {
+        if (this.props.application.enableAutoSignin && silentSignin === null && !this.requiresExplicitSignin()) {
           const values = {};
           values["application"] = this.props.application.name;
           this.login(values);
         }
       }
     }
+  }
+
+  requiresExplicitSignin() {
+    return Util.requiresExplicitOAuthSignin(Util.getOAuthGetParameters());
   }
 
   checkCaptchaStatus(values) {
@@ -353,9 +357,11 @@ class LoginPage extends React.Component {
     const ths = this;
     const oAuthParams = Util.getOAuthGetParameters();
     const code = resp.data;
-    const concatChar = oAuthParams?.redirectUri?.includes("?") ? "&" : "?";
     const noRedirect = oAuthParams.noRedirect;
-    const redirectUrl = `${oAuthParams.redirectUri}${concatChar}code=${code}&state=${oAuthParams.state}`;
+    const redirectUrl = Util.addSearchParamsToUrl(oAuthParams.redirectUri, {
+      code: code,
+      state: oAuthParams.state,
+    });
     if (resp.data === RequiredMfa) {
       this.props.onLoginSuccess(window.location.href);
       return;
@@ -1300,6 +1306,9 @@ class LoginPage extends React.Component {
     if (this.state.userCode && this.state.userCodeStatus === "success") {
       return null;
     }
+    if (this.requiresExplicitSignin()) {
+      return null;
+    }
 
     return (
       <div>
@@ -1357,8 +1366,15 @@ class LoginPage extends React.Component {
     const oAuthParams = Util.getOAuthGetParameters();
     this.populateOauthValues(values);
     const application = this.getApplicationObj();
-    const usernameParam = `&name=${encodeURIComponent(username)}`;
-    return fetch(`${Setting.ServerUrl}/api/webauthn/signin/begin?owner=${application.organization}${username ? usernameParam : ""}`, {
+    const webAuthnParams = AuthBackend.getWebAuthnSigninSearchParams(oAuthParams, values["type"]);
+    const beginParams = new URLSearchParams(webAuthnParams);
+    beginParams.set("owner", application.organization);
+    if (username) {
+      beginParams.set("name", username);
+    }
+    const beginUrl = new URL(`${Setting.ServerUrl}/api/webauthn/signin/begin`, window.location.origin);
+    beginUrl.search = beginParams.toString();
+    return fetch(beginUrl.toString(), {
       method: "GET",
       credentials: "include",
     })
@@ -1385,14 +1401,9 @@ class LoginPage extends React.Component {
         const rawId = assertion.rawId;
         const sig = assertion.response.signature;
         const userHandle = assertion.response.userHandle;
-        const resourceQuery = oAuthParams?.resource
-          ? `&resource=${encodeURIComponent(oAuthParams.resource)}`
-          : "";
-        let finishUrl = `${Setting.ServerUrl}/api/webauthn/signin/finish?responseType=${values["type"]}`;
-        if (values["type"] === "code") {
-          finishUrl = `${Setting.ServerUrl}/api/webauthn/signin/finish?responseType=${values["type"]}&clientId=${oAuthParams.clientId}&scope=${oAuthParams.scope}&redirectUri=${oAuthParams.redirectUri}&nonce=${oAuthParams.nonce}&state=${oAuthParams.state}&codeChallenge=${oAuthParams.codeChallenge}&challengeMethod=${oAuthParams.challengeMethod}${resourceQuery}`;
-        }
-        return fetch(finishUrl, {
+        const finishUrl = new URL(`${Setting.ServerUrl}/api/webauthn/signin/finish`, window.location.origin);
+        finishUrl.search = webAuthnParams.toString();
+        return fetch(finishUrl.toString(), {
           method: "POST",
           credentials: "include",
           headers: {
@@ -1417,7 +1428,15 @@ class LoginPage extends React.Component {
                 this.postCodeLoginAction(res);
               } else if (responseType === "token" || responseType === "id_token") {
                 const accessToken = res.data;
-                Setting.goToLink(`${oAuthParams.redirectUri}#${responseType}=${accessToken}?state=${oAuthParams.state}&token_type=bearer`);
+                const responseName = responseType === "token" ? "access_token" : "id_token";
+                const fragment = new URLSearchParams({
+                  [responseName]: accessToken,
+                  state: oAuthParams.state,
+                  token_type: "bearer",
+                });
+                const redirectUrl = new URL(oAuthParams.redirectUri);
+                redirectUrl.hash = fragment.toString();
+                Setting.goToLink(redirectUrl.toString());
               } else {
                 Setting.showMessage("success", i18next.t("login:Successfully logged in with WebAuthn credentials"));
                 Setting.goToLink("/");

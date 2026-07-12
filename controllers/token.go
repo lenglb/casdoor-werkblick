@@ -17,7 +17,6 @@ package controllers
 import (
 	"encoding/json"
 	"fmt"
-	"time"
 
 	"github.com/beego/beego/v2/core/utils/pagination"
 	"github.com/casdoor/casdoor/object"
@@ -49,7 +48,7 @@ func (c *ApiController) GetTokens() {
 			return
 		}
 
-		c.ResponseOk(token)
+		c.ResponseOk(object.MaskTokensForResponse(token))
 	} else {
 		limit := util.ParseInt(limit)
 		count, err := object.GetTokenCount(owner, organization, field, value)
@@ -65,7 +64,7 @@ func (c *ApiController) GetTokens() {
 			return
 		}
 
-		c.ResponseOk(tokens, paginator.Nums())
+		c.ResponseOk(object.MaskTokensForResponse(tokens), paginator.Nums())
 	}
 }
 
@@ -96,7 +95,7 @@ func (c *ApiController) GetToken() {
 		return
 	}
 
-	c.ResponseOk(token)
+	c.ResponseOk(object.MaskTokenForResponse(token))
 }
 
 // UpdateToken
@@ -129,15 +128,7 @@ func (c *ApiController) UpdateToken() {
 // @Success 200 {object} controllers.Response The Response object
 // @router /add-token [post]
 func (c *ApiController) AddToken() {
-	var token object.Token
-	err := json.Unmarshal(c.Ctx.Input.RequestBody, &token)
-	if err != nil {
-		c.ResponseError(err.Error())
-		return
-	}
-
-	c.Data["json"] = wrapActionResponse(object.AddToken(&token))
-	c.ServeJSON()
+	c.ResponseError("manual token creation is disabled; use an OAuth grant")
 }
 
 // DeleteToken
@@ -172,6 +163,8 @@ func (c *ApiController) DeleteToken() {
 // @Success 401 {object} object.TokenError The Response object
 // @router /login/oauth/access_token [post]
 func (c *ApiController) GetOAuthToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
 	clientId := c.Ctx.Input.Query("client_id")
 	clientSecret := c.Ctx.Input.Query("client_secret")
 	assertion := c.Ctx.Input.Query("assertion")
@@ -266,78 +259,7 @@ func (c *ApiController) GetOAuthToken() {
 	dpopProof := c.Ctx.Request.Header.Get("DPoP")
 
 	host := c.Ctx.Request.Host
-	var pendingDeviceCode string
-	var pendingDeviceAuthCache object.DeviceAuthCache
-
-	if deviceCode != "" {
-		deviceAuthCache, ok := object.DeviceAuthMap.Load(deviceCode)
-		if !ok {
-			c.Data["json"] = &object.TokenError{
-				Error:            "expired_token",
-				ErrorDescription: "token is expired",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-
-		deviceAuthCacheCast := deviceAuthCache.(object.DeviceAuthCache)
-
-		if deviceAuthCacheCast.RequestAt.Add(time.Second * object.DeviceAuthExpiresIn).Before(time.Now()) {
-			object.DeviceAuthMap.Delete(deviceCode)
-			c.Data["json"] = &object.TokenError{
-				Error:            "expired_token",
-				ErrorDescription: "token is expired",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-
-		if deviceAuthCacheCast.Status == object.DeviceAuthStatusDenied {
-			c.Data["json"] = &object.TokenError{
-				Error:            "access_denied",
-				ErrorDescription: "device login was denied",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-
-		if deviceAuthCacheCast.Status == object.DeviceAuthStatusTokenIssued {
-			c.Data["json"] = &object.TokenError{
-				Error:            "access_denied",
-				ErrorDescription: "device_code has already been used",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-
-		if !deviceAuthCacheCast.UserSignIn {
-			c.Data["json"] = &object.TokenError{
-				Error:            "authorization_pending",
-				ErrorDescription: "authorization pending",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-		// Bind client_id to the application from the original device auth request.
-		if deviceAuthCacheCast.ClientId != "" && deviceAuthCacheCast.ClientId != clientId {
-			c.Data["json"] = &object.TokenError{
-				Error:            object.InvalidClient,
-				ErrorDescription: "client_id does not match the device authorization request",
-			}
-			c.SetTokenErrorHttpStatus()
-			c.ServeJSON()
-			return
-		}
-		username = deviceAuthCacheCast.UserName
-		scope = deviceAuthCacheCast.Scope
-		pendingDeviceCode = deviceCode
-		pendingDeviceAuthCache = deviceAuthCacheCast
-	} else if grantType == "urn:ietf:params:oauth:grant-type:device_code" {
+	if grantType == "urn:ietf:params:oauth:grant-type:device_code" && deviceCode == "" {
 		c.Data["json"] = &object.TokenError{
 			Error:            "invalid_request",
 			ErrorDescription: "device_code parameter is required for this grant type",
@@ -346,18 +268,27 @@ func (c *ApiController) GetOAuthToken() {
 		c.ServeJSON()
 		return
 	}
-
-	token, err := object.GetOAuthToken(grantType, clientId, clientSecret, code, verifier, scope, nonce, username, password, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, dpopProof)
-	if err != nil {
-		c.ResponseError(err.Error())
+	if deviceCode != "" && grantType != "urn:ietf:params:oauth:grant-type:device_code" {
+		c.Data["json"] = &object.TokenError{
+			Error:            object.InvalidRequest,
+			ErrorDescription: "device_code is only valid with the device_code grant type",
+		}
+		c.SetTokenErrorHttpStatus()
+		c.ServeJSON()
 		return
 	}
 
-	if pendingDeviceCode != "" {
-		if _, isTokenError := token.(*object.TokenError); !isTokenError {
-			pendingDeviceAuthCache.Status = object.DeviceAuthStatusTokenIssued
-			object.DeviceAuthMap.Store(pendingDeviceCode, pendingDeviceAuthCache)
-		}
+	clientAuthentication, tokenError := c.getOAuthClientAuthentication()
+	if tokenError != nil {
+		c.ResponseTokenError(tokenError.Error, tokenError.ErrorDescription)
+		return
+	}
+	clientId = clientAuthentication.ClientId
+	clientSecret = clientAuthentication.ClientSecret
+	token, err := object.GetOAuthToken(grantType, clientId, clientSecret, code, verifier, scope, nonce, username, password, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, deviceCode, dpopProof, clientAuthentication)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
 	}
 
 	c.Data["json"] = token
@@ -379,6 +310,8 @@ func (c *ApiController) GetOAuthToken() {
 // @Success 401 {object} object.TokenError The Response object
 // @router /login/oauth/refresh_token [post]
 func (c *ApiController) RefreshToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
 	grantType := c.Ctx.Input.Query("grant_type")
 	refreshToken := c.Ctx.Input.Query("refresh_token")
 	scope := c.Ctx.Input.Query("scope")
@@ -398,13 +331,15 @@ func (c *ApiController) RefreshToken() {
 		}
 	}
 
-	ok, application, clientId, _, err := c.ValidateOAuth(true)
+	ok, application, clientId, authenticatedClientSecret, err := c.ValidateOAuth(true)
 	if err != nil || !ok {
 		return
 	}
+	clientSecret = authenticatedClientSecret
 
 	dpopProof := c.Ctx.Request.Header.Get("DPoP")
-	refreshToken2, err := object.RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, host, dpopProof)
+	dpopHtu := object.GetDPoPHtu(host, c.Ctx.Request.URL.EscapedPath())
+	refreshToken2, err := object.RefreshToken(application, grantType, refreshToken, scope, clientId, clientSecret, host, dpopProof, dpopHtu)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -425,67 +360,27 @@ func (c *ApiController) ResponseTokenError(errorMsg string, errorDescription str
 }
 
 func (c *ApiController) ValidateOAuth(ignoreValidSecret bool) (ok bool, application *object.Application, clientId, clientSecret string, err error) {
-	reqClientId := c.Ctx.Input.Query("client_id")
-	reqClientSecret := c.Ctx.Input.Query("client_secret")
-	clientAssertion := c.Ctx.Input.Query("client_assertion")
-	clientAssertionType := c.Ctx.Input.Query("client_assertion_type")
-
-	if reqClientId == "" && clientAssertionType == "" {
-		var tokenRequest TokenRequest
-		if err := json.Unmarshal(c.Ctx.Input.RequestBody, &tokenRequest); err == nil {
-			reqClientId = tokenRequest.ClientId
-			reqClientSecret = tokenRequest.ClientSecret
-			clientAssertion = tokenRequest.ClientAssertion
-			clientAssertionType = tokenRequest.ClientAssertionType
-		}
+	// The old ignoreValidSecret path let callers postpone authentication to a
+	// grant implementation and thereby lose the credential transport. All token
+	// endpoints now enforce the registered method before processing credentials.
+	_ = ignoreValidSecret
+	authentication, tokenError := c.getOAuthClientAuthentication()
+	if tokenError != nil {
+		c.ResponseTokenError(tokenError.Error, tokenError.ErrorDescription)
+		return false, nil, "", "", nil
 	}
 
-	if clientAssertionType == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" {
-		ok, application, err = object.ValidateClientAssertion(clientAssertion, c.Ctx.Request.Host)
-		if err != nil {
-			c.ResponseTokenError(object.InvalidClient, err.Error())
-			return
-		}
-
-		if !ok || application == nil {
-			c.ResponseTokenError(object.InvalidClient, "client_assertion is invalid")
-			return
-		}
-
-		clientSecret = application.ClientSecret
-		clientId = application.ClientId
-		ok = true
-		return
-	}
-
-	if reqClientId == "" && reqClientSecret == "" {
-		clientId, clientSecret, ok = c.Ctx.Request.BasicAuth()
-		if !ok {
-			clientId = c.Ctx.Input.Query("client_id")
-			clientSecret = c.Ctx.Input.Query("client_secret")
-			if clientId == "" || clientSecret == "" {
-				c.ResponseTokenError(object.InvalidRequest, "")
-				return
-			}
-		}
-	} else {
-		clientId = reqClientId
-		clientSecret = reqClientSecret
-	}
-
-	application, err = object.GetApplicationByClientId(clientId)
+	application, tokenError, err = object.AuthenticateOAuthClient(authentication, c.Ctx.Request.Host)
 	if err != nil {
 		c.ResponseTokenError(object.InvalidClient, err.Error())
-		return
+		return false, nil, "", "", err
+	}
+	if tokenError != nil {
+		c.ResponseTokenError(tokenError.Error, tokenError.ErrorDescription)
+		return false, nil, "", "", nil
 	}
 
-	if application == nil || (application.ClientSecret != clientSecret && !ignoreValidSecret) {
-		c.ResponseTokenError(object.InvalidClient, c.T("token:Invalid application or wrong clientSecret"))
-		return
-	}
-
-	ok = true
-	return
+	return true, application, authentication.ClientId, authentication.EffectiveClientSecret(application), nil
 }
 
 // IntrospectToken
@@ -504,10 +399,16 @@ func (c *ApiController) ValidateOAuth(ignoreValidSecret bool) (ok bool, applicat
 // @Success 401 {object} object.TokenError The Response object
 // @router /login/oauth/introspect [post]
 func (c *ApiController) IntrospectToken() {
+	c.Ctx.Output.Header("Cache-Control", "no-store")
+	c.Ctx.Output.Header("Pragma", "no-cache")
 	tokenValue := c.Ctx.Input.Query("token")
 
 	ok, application, _, _, err := c.ValidateOAuth(false)
 	if err != nil || !ok {
+		return
+	}
+	if application.IsPublicClient() {
+		c.ResponseTokenError(object.InvalidClient, "public clients cannot use token introspection")
 		return
 	}
 
@@ -518,111 +419,92 @@ func (c *ApiController) IntrospectToken() {
 
 	tokenTypeHint := c.Ctx.Input.Query("token_type_hint")
 	var token *object.Token
-	if tokenTypeHint != "" {
-		token, err = object.GetTokenByTokenValue(tokenValue, tokenTypeHint)
-		if err != nil {
-			c.ResponseTokenError(object.InvalidRequest, err.Error())
-			return
-		}
-		if token == nil || token.ExpiresIn <= 0 {
-			respondWithInactiveToken()
-			return
-		}
-
-		if token.ExpiresIn <= 0 {
-			c.Data["json"] = &object.IntrospectionResponse{Active: false}
-			c.ServeJSON()
-			return
-		}
+	credentialType := ""
+	switch tokenTypeHint {
+	case "", "access_token", "access-token", "refresh_token", "refresh-token":
+	default:
+		c.ResponseTokenError(object.InvalidRequest, "unsupported token_type_hint")
+		return
 	}
-
-	var introspectionResponse object.IntrospectionResponse
-
-	if application.TokenFormat == "JWT-Standard" {
-		jwtToken, err := object.ParseStandardJwtTokenByApplication(tokenValue, application)
-		if err != nil {
-			// and token revoked case. but we not implement
-			// TODO: 2022-03-03 add token revoked check, when we implemented the Token Revocation(rfc7009) Specs.
-			// refs: https://tools.ietf.org/html/rfc7009
-			respondWithInactiveToken()
-			return
-		}
-
-		introspectionResponse = object.IntrospectionResponse{
-			Active:    true,
-			Scope:     jwtToken.Scope,
-			Username:  jwtToken.Name,
-			TokenType: jwtToken.TokenType,
-			Exp:       jwtToken.ExpiresAt.Unix(),
-			Iat:       jwtToken.IssuedAt.Unix(),
-			Nbf:       jwtToken.NotBefore.Unix(),
-			Sub:       jwtToken.Subject,
-			Aud:       jwtToken.Audience,
-			Iss:       jwtToken.Issuer,
-			Jti:       jwtToken.ID,
-		}
+	if tokenTypeHint == "access_token" || tokenTypeHint == "access-token" {
+		credentialType = "access-token"
+		token, err = object.GetTokenByAccessToken(tokenValue)
+	} else if tokenTypeHint == "refresh_token" || tokenTypeHint == "refresh-token" {
+		credentialType = "refresh-token"
+		token, err = object.GetTokenByRefreshToken(tokenValue)
 	} else {
-		jwtToken, err := object.ParseJwtTokenByApplication(tokenValue, application)
-		if err != nil {
-			// and token revoked case. but we not implement
-			// TODO: 2022-03-03 add token revoked check, when we implemented the Token Revocation(rfc7009) Specs.
-			// refs: https://tools.ietf.org/html/rfc7009
+		token, err = object.GetTokenByAccessToken(tokenValue)
+		credentialType = "access-token"
+		if err == nil && token == nil {
+			token, err = object.GetTokenByRefreshToken(tokenValue)
+			credentialType = "refresh-token"
+		}
+	}
+	if err != nil {
+		c.ResponseTokenError(object.InvalidRequest, err.Error())
+		return
+	}
+	if token == nil || token.ExpiresIn <= 0 {
+		respondWithInactiveToken()
+		return
+	}
+	// An authenticated client must not be able to inspect credentials issued
+	// to another application, even when it knows the opaque/JWT value.
+	if token.Owner != application.Owner || token.Application != application.Name {
+		respondWithInactiveToken()
+		return
+	}
+
+	introspectionResponse := object.IntrospectionResponse{
+		Active:    true,
+		Scope:     token.Scope,
+		ClientId:  application.ClientId,
+		Username:  token.User,
+		TokenType: token.TokenType,
+	}
+	if token.DPoPJkt != "" {
+		introspectionResponse.Cnf = &object.DPoPConfirmation{JKT: token.DPoPJkt}
+	}
+
+	if credentialType == "refresh-token" {
+		claims, parseErr := object.ParseRefreshJwtTokenByApplication(tokenValue, application)
+		if parseErr != nil || claims.Azp != application.ClientId || claims.Scope != token.Scope || !object.DPoPConfirmationMatches(claims.Cnf, token.DPoPJkt) {
 			respondWithInactiveToken()
 			return
 		}
-
-		introspectionResponse = object.IntrospectionResponse{
-			Active: true,
-			Exp:    jwtToken.ExpiresAt.Unix(),
-			Iat:    jwtToken.IssuedAt.Unix(),
-			Nbf:    jwtToken.NotBefore.Unix(),
-			Sub:    jwtToken.Subject,
-			Aud:    jwtToken.Audience,
-			Iss:    jwtToken.Issuer,
-			Jti:    jwtToken.ID,
-		}
-
-		if jwtToken.Scope != "" {
-			introspectionResponse.Scope = jwtToken.Scope
-		}
-		if jwtToken.Name != "" {
-			introspectionResponse.Username = jwtToken.Name
-		}
-		if jwtToken.TokenType != "" {
-			introspectionResponse.TokenType = jwtToken.TokenType
-		}
-	}
-
-	if tokenTypeHint == "" {
-		token, err = object.GetTokenByTokenValue(tokenValue, introspectionResponse.TokenType)
-		if err != nil {
-			c.ResponseTokenError(object.InvalidRequest, err.Error())
-			return
-		}
-		if token == nil || token.ExpiresIn <= 0 {
+		introspectionResponse.Exp = object.NumericDateUnix(claims.ExpiresAt)
+		introspectionResponse.Iat = object.NumericDateUnix(claims.IssuedAt)
+		introspectionResponse.Nbf = object.NumericDateUnix(claims.NotBefore)
+		introspectionResponse.Sub = claims.Subject
+		introspectionResponse.Aud = claims.Audience
+		introspectionResponse.Iss = claims.Issuer
+		introspectionResponse.Jti = claims.ID
+	} else if application.TokenFormat == "JWT-Standard" {
+		claims, parseErr := object.ParseStandardJwtTokenByApplication(tokenValue, application)
+		if parseErr != nil || claims.TokenType != "access-token" || claims.Azp != application.ClientId || !object.DPoPConfirmationMatches(claims.Cnf, token.DPoPJkt) {
 			respondWithInactiveToken()
 			return
 		}
-	}
-
-	if token != nil {
-		application, err = object.GetApplication(fmt.Sprintf("%s/%s", token.Owner, token.Application))
-		if err != nil {
-			c.ResponseTokenError(object.InvalidClient, err.Error())
+		introspectionResponse.Exp = object.NumericDateUnix(claims.ExpiresAt)
+		introspectionResponse.Iat = object.NumericDateUnix(claims.IssuedAt)
+		introspectionResponse.Nbf = object.NumericDateUnix(claims.NotBefore)
+		introspectionResponse.Sub = claims.Subject
+		introspectionResponse.Aud = claims.Audience
+		introspectionResponse.Iss = claims.Issuer
+		introspectionResponse.Jti = claims.ID
+	} else {
+		claims, parseErr := object.ParseJwtTokenByApplication(tokenValue, application)
+		if parseErr != nil || claims.TokenType != "access-token" || claims.Azp != application.ClientId || !object.DPoPConfirmationMatches(claims.Cnf, token.DPoPJkt) {
+			respondWithInactiveToken()
 			return
 		}
-		if application == nil {
-			c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), token.Application))
-			return
-		}
-
-		introspectionResponse.TokenType = token.TokenType
-		introspectionResponse.ClientId = application.ClientId
-
-		// Expose DPoP key binding in the introspection response (RFC 9449 §8).
-		if token.DPoPJkt != "" {
-			introspectionResponse.Cnf = &object.DPoPConfirmation{JKT: token.DPoPJkt}
-		}
+		introspectionResponse.Exp = object.NumericDateUnix(claims.ExpiresAt)
+		introspectionResponse.Iat = object.NumericDateUnix(claims.IssuedAt)
+		introspectionResponse.Nbf = object.NumericDateUnix(claims.NotBefore)
+		introspectionResponse.Sub = claims.Subject
+		introspectionResponse.Aud = claims.Audience
+		introspectionResponse.Iss = claims.Issuer
+		introspectionResponse.Jti = claims.ID
 	}
 
 	c.Data["json"] = introspectionResponse

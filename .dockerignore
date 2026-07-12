@@ -1,1 +1,34 @@
-web/node_modules/
+.git
+.github
+.idea
+.vscode
+.DS_Store
+
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+**/*.p12
+**/*.pfx
+
+**/node_modules
+web/build
+
+bin
+files
+logs
+temp
+tmp
+
+**/*.db
+**/*.db-shm
+**/*.db-wal
+**/coverage
+
+# Production configuration and credentials are runtime inputs. The hardened
+# image deliberately fails closed if /conf/app.conf is not mounted.
+conf/app.conf
+
+Dockerfile
+docker-compose.yml
+docs

@@ -31,6 +31,8 @@ type PushMfa struct {
 	challengeExp time.Time
 }
 
+var errPushMfaApprovalUnavailable = errors.New("push MFA is disabled until a signed, one-time approval callback is implemented")
+
 func (mfa *PushMfa) Initiate(userId string, issuer string) (*MfaProps, error) {
 	mfaProps := MfaProps{
 		MfaType: mfa.MfaType,
@@ -39,56 +41,18 @@ func (mfa *PushMfa) Initiate(userId string, issuer string) (*MfaProps, error) {
 }
 
 func (mfa *PushMfa) SetupVerify(passCode string) error {
-	if mfa.Secret == "" {
-		return errors.New("push notification receiver is required")
-	}
-
-	if mfa.provider == nil {
-		return errors.New("push notification provider is not configured")
-	}
-
-	// For setup verification, send a test notification
-	// Note: Full implementation would require a callback endpoint to receive approval/denial
-	// from the mobile app, and passCode would contain the callback verification token
-	return mfa.sendPushNotification("MFA Setup Verification", "Please approve this setup request on your device")
+	// Sending a notification is not proof that the user approved it. Fail closed
+	// until the challenge has a signed, user/device-bound, expiring and one-shot
+	// callback that can be verified here.
+	return errPushMfaApprovalUnavailable
 }
 
 func (mfa *PushMfa) Enable(user *User) error {
-	columns := []string{"recovery_codes", "preferred_mfa_type", "mfa_push_enabled", "mfa_push_receiver", "mfa_push_provider"}
-
-	user.RecoveryCodes = append(user.RecoveryCodes, mfa.RecoveryCodes...)
-	if user.PreferredMfaType == "" {
-		user.PreferredMfaType = mfa.MfaType
-	}
-
-	user.MfaPushEnabled = true
-	user.MfaPushReceiver = mfa.Secret
-	user.MfaPushProvider = mfa.URL
-
-	_, err := UpdateUser(user.GetId(), user, columns, false)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return errPushMfaApprovalUnavailable
 }
 
 func (mfa *PushMfa) Verify(passCode string) error {
-	if mfa.Secret == "" {
-		return errors.New("push notification receiver is required")
-	}
-
-	if mfa.provider == nil {
-		return errors.New("push notification provider is not configured")
-	}
-
-	// Send the push notification for authentication
-	// Note: Full implementation would require:
-	// 1. A callback endpoint to receive approval/denial from the mobile app
-	// 2. Persistent storage of challengeId to validate the callback
-	// 3. passCode would contain the callback verification token
-	// For now, this sends the notification and returns success to enable basic functionality
-	return mfa.sendPushNotification("MFA Verification", "Authentication request. Please approve or deny.")
+	return errPushMfaApprovalUnavailable
 }
 
 func (mfa *PushMfa) sendPushNotification(title string, message string) error {

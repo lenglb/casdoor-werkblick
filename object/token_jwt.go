@@ -15,8 +15,10 @@
 package object
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,10 +29,14 @@ import (
 
 type Claims struct {
 	*User
-	TokenType string `json:"tokenType,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Tag       string `json:"tag"`
-	Scope     string `json:"scope,omitempty"`
+	TokenType             string            `json:"tokenType,omitempty"`
+	Nonce                 string            `json:"nonce,omitempty"`
+	Tag                   string            `json:"tag"`
+	Scope                 string            `json:"scope,omitempty"`
+	AuthenticationMethods []string          `json:"amr,omitempty"`
+	AuthTime              int64             `json:"auth_time,omitempty"`
+	Acr                   string            `json:"acr,omitempty"`
+	Cnf                   *DPoPConfirmation `json:"cnf,omitempty"`
 	// the `azp` (Authorized Party) claim. Optional. See https://openid.net/specs/openid-connect-core-1_0.html#IDToken
 	Azp      string `json:"azp,omitempty"`
 	Provider string `json:"provider,omitempty"`
@@ -72,9 +78,6 @@ type UserWithoutThirdIdp struct {
 
 	Id                string   `xorm:"varchar(100) index" json:"id"`
 	Type              string   `xorm:"varchar(100)" json:"type"`
-	Password          string   `xorm:"varchar(150)" json:"password"`
-	PasswordSalt      string   `xorm:"varchar(100)" json:"passwordSalt"`
-	PasswordType      string   `xorm:"varchar(100)" json:"passwordType"`
 	DisplayName       string   `xorm:"varchar(100)" json:"displayName"`
 	FirstName         string   `xorm:"varchar(100)" json:"firstName"`
 	LastName          string   `xorm:"varchar(100)" json:"lastName"`
@@ -108,8 +111,6 @@ type UserWithoutThirdIdp struct {
 	IsForbidden       bool     `json:"isForbidden"`
 	IsDeleted         bool     `json:"isDeleted"`
 	SignupApplication string   `xorm:"varchar(100)" json:"signupApplication"`
-	Hash              string   `xorm:"varchar(100)" json:"hash"`
-	PreHash           string   `xorm:"varchar(100)" json:"preHash"`
 	RegisterType      string   `xorm:"varchar(100)" json:"registerType"`
 	RegisterSource    string   `xorm:"varchar(100)" json:"registerSource"`
 
@@ -131,11 +132,9 @@ type UserWithoutThirdIdp struct {
 	LastSigninIp   string `xorm:"varchar(100)" json:"lastSigninIp"`
 
 	// WebauthnCredentials []webauthn.Credential `xorm:"webauthnCredentials blob" json:"webauthnCredentials"`
-	PreferredMfaType string   `xorm:"varchar(100)" json:"preferredMfaType"`
-	RecoveryCodes    []string `xorm:"varchar(1000)" json:"recoveryCodes"`
-	TotpSecret       string   `xorm:"varchar(100)" json:"totpSecret"`
-	MfaPhoneEnabled  bool     `json:"mfaPhoneEnabled"`
-	MfaEmailEnabled  bool     `json:"mfaEmailEnabled"`
+	PreferredMfaType string `xorm:"varchar(100)" json:"preferredMfaType"`
+	MfaPhoneEnabled  bool   `json:"mfaPhoneEnabled"`
+	MfaEmailEnabled  bool   `json:"mfaEmailEnabled"`
 	// MultiFactorAuths    []*MfaProps           `xorm:"-" json:"multiFactorAuths,omitempty"`
 
 	Ldap       string            `xorm:"ldap varchar(100)" json:"ldap"`
@@ -147,17 +146,33 @@ type UserWithoutThirdIdp struct {
 
 	LastSigninWrongTime string `xorm:"varchar(100)" json:"lastSigninWrongTime"`
 	SigninWrongTimes    int    `json:"signinWrongTimes"`
+}
 
-	ManagedAccounts []ManagedAccount `xorm:"managedAccounts blob" json:"managedAccounts"`
+// RefreshClaims deliberately contains no user or application-defined claims.
+// Refresh tokens are long-lived credentials and should only carry the metadata
+// required to validate and rotate them.
+type RefreshClaims struct {
+	TokenType             string            `json:"tokenType"`
+	Scope                 string            `json:"scope,omitempty"`
+	Azp                   string            `json:"azp,omitempty"`
+	AuthenticationMethods []string          `json:"amr,omitempty"`
+	AuthTime              int64             `json:"auth_time,omitempty"`
+	Acr                   string            `json:"acr,omitempty"`
+	Cnf                   *DPoPConfirmation `json:"cnf,omitempty"`
+	jwt.RegisteredClaims
 }
 
 type ClaimsShort struct {
 	*UserShort
-	TokenType string `json:"tokenType,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	Azp       string `json:"azp,omitempty"`
-	Provider  string `json:"provider,omitempty"`
+	TokenType             string            `json:"tokenType,omitempty"`
+	Nonce                 string            `json:"nonce,omitempty"`
+	Scope                 string            `json:"scope,omitempty"`
+	Azp                   string            `json:"azp,omitempty"`
+	Provider              string            `json:"provider,omitempty"`
+	AuthenticationMethods []string          `json:"amr,omitempty"`
+	AuthTime              int64             `json:"auth_time,omitempty"`
+	Acr                   string            `json:"acr,omitempty"`
+	Cnf                   *DPoPConfirmation `json:"cnf,omitempty"`
 
 	SigninMethod string `json:"signinMethod,omitempty"`
 	jwt.RegisteredClaims
@@ -174,12 +189,16 @@ type OIDCAddress struct {
 
 type ClaimsWithoutThirdIdp struct {
 	*UserWithoutThirdIdp
-	TokenType string `json:"tokenType,omitempty"`
-	Nonce     string `json:"nonce,omitempty"`
-	Tag       string `json:"tag"`
-	Scope     string `json:"scope,omitempty"`
-	Azp       string `json:"azp,omitempty"`
-	Provider  string `json:"provider,omitempty"`
+	TokenType             string            `json:"tokenType,omitempty"`
+	Nonce                 string            `json:"nonce,omitempty"`
+	Tag                   string            `json:"tag"`
+	Scope                 string            `json:"scope,omitempty"`
+	Azp                   string            `json:"azp,omitempty"`
+	Provider              string            `json:"provider,omitempty"`
+	AuthenticationMethods []string          `json:"amr,omitempty"`
+	AuthTime              int64             `json:"auth_time,omitempty"`
+	Acr                   string            `json:"acr,omitempty"`
+	Cnf                   *DPoPConfirmation `json:"cnf,omitempty"`
 
 	SigninMethod string `json:"signinMethod,omitempty"`
 	jwt.RegisteredClaims
@@ -225,9 +244,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 
 		Id:                user.Id,
 		Type:              user.Type,
-		Password:          user.Password,
-		PasswordSalt:      user.PasswordSalt,
-		PasswordType:      user.PasswordType,
 		DisplayName:       user.DisplayName,
 		FirstName:         user.FirstName,
 		LastName:          user.LastName,
@@ -261,8 +277,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 		IsForbidden:       user.IsForbidden,
 		IsDeleted:         user.IsDeleted,
 		SignupApplication: user.SignupApplication,
-		Hash:              user.Hash,
-		PreHash:           user.PreHash,
 		RegisterType:      user.RegisterType,
 		RegisterSource:    user.RegisterSource,
 
@@ -284,13 +298,11 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 		LastSigninIp:   user.LastSigninIp,
 
 		PreferredMfaType: user.PreferredMfaType,
-		RecoveryCodes:    user.RecoveryCodes,
-		TotpSecret:       user.TotpSecret,
 		MfaPhoneEnabled:  user.MfaPhoneEnabled,
 		MfaEmailEnabled:  user.MfaEmailEnabled,
 
 		Ldap:       user.Ldap,
-		Properties: user.Properties,
+		Properties: getTokenSafeProperties(user.Properties),
 
 		Roles:       user.Roles,
 		Permissions: user.Permissions,
@@ -298,8 +310,6 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 
 		LastSigninWrongTime: user.LastSigninWrongTime,
 		SigninWrongTimes:    user.SigninWrongTimes,
-
-		ManagedAccounts: user.ManagedAccounts,
 	}
 
 	return res
@@ -307,34 +317,135 @@ func getUserWithoutThirdIdp(user *User) *UserWithoutThirdIdp {
 
 func getShortClaims(claims Claims) ClaimsShort {
 	res := ClaimsShort{
-		UserShort:        getShortUser(claims.User),
-		TokenType:        claims.TokenType,
-		Nonce:            claims.Nonce,
-		Scope:            claims.Scope,
-		RegisteredClaims: claims.RegisteredClaims,
-		Azp:              claims.Azp,
-		SigninMethod:     claims.SigninMethod,
-		Provider:         claims.Provider,
+		UserShort:             getShortUser(claims.User),
+		TokenType:             claims.TokenType,
+		Nonce:                 claims.Nonce,
+		Scope:                 claims.Scope,
+		RegisteredClaims:      claims.RegisteredClaims,
+		Azp:                   claims.Azp,
+		SigninMethod:          claims.SigninMethod,
+		Provider:              claims.Provider,
+		AuthenticationMethods: slices.Clone(claims.AuthenticationMethods),
+		AuthTime:              claims.AuthTime,
+		Acr:                   claims.Acr,
+		Cnf:                   cloneDPoPConfirmation(claims.Cnf),
 	}
 	return res
 }
 
 func getClaimsWithoutThirdIdp(claims Claims) ClaimsWithoutThirdIdp {
 	res := ClaimsWithoutThirdIdp{
-		UserWithoutThirdIdp: getUserWithoutThirdIdp(claims.User),
-		TokenType:           claims.TokenType,
-		Nonce:               claims.Nonce,
-		Tag:                 claims.Tag,
-		Scope:               claims.Scope,
-		RegisteredClaims:    claims.RegisteredClaims,
-		Azp:                 claims.Azp,
-		SigninMethod:        claims.SigninMethod,
-		Provider:            claims.Provider,
+		UserWithoutThirdIdp:   getUserWithoutThirdIdp(claims.User),
+		TokenType:             claims.TokenType,
+		Nonce:                 claims.Nonce,
+		Tag:                   claims.Tag,
+		Scope:                 claims.Scope,
+		RegisteredClaims:      claims.RegisteredClaims,
+		Azp:                   claims.Azp,
+		SigninMethod:          claims.SigninMethod,
+		Provider:              claims.Provider,
+		AuthenticationMethods: slices.Clone(claims.AuthenticationMethods),
+		AuthTime:              claims.AuthTime,
+		Acr:                   claims.Acr,
+		Cnf:                   cloneDPoPConfirmation(claims.Cnf),
 	}
 	return res
 }
 
-// getUserFieldValue gets the value of a user field by name, handling special cases like Roles and Permissions
+func getRefreshClaims(claims Claims, expiresAt time.Time) RefreshClaims {
+	registeredClaims := claims.RegisteredClaims
+	registeredClaims.ExpiresAt = jwt.NewNumericDate(expiresAt)
+
+	return RefreshClaims{
+		TokenType:             "refresh-token",
+		Scope:                 claims.Scope,
+		Azp:                   claims.Azp,
+		AuthenticationMethods: slices.Clone(claims.AuthenticationMethods),
+		AuthTime:              claims.AuthTime,
+		Acr:                   claims.Acr,
+		Cnf:                   cloneDPoPConfirmation(claims.Cnf),
+		RegisteredClaims:      registeredClaims,
+	}
+}
+
+func cloneDPoPConfirmation(confirmation *DPoPConfirmation) *DPoPConfirmation {
+	if confirmation == nil {
+		return nil
+	}
+	return &DPoPConfirmation{JKT: confirmation.JKT}
+}
+
+// DPoPConfirmationMatches compares the signed cnf claim with the persisted
+// token binding. Both must be absent for a Bearer token or both must contain
+// exactly the same JWK thumbprint for a DPoP token.
+func DPoPConfirmationMatches(confirmation *DPoPConfirmation, persistedJkt string) bool {
+	if confirmation == nil {
+		return persistedJkt == ""
+	}
+	if confirmation.JKT == "" || persistedJkt == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(confirmation.JKT), []byte(persistedJkt)) == 1
+}
+
+func NumericDateUnix(date *jwt.NumericDate) int64 {
+	if date == nil {
+		return 0
+	}
+	return date.Unix()
+}
+
+var safeCustomTokenUserFields = map[string]struct{}{
+	"Owner": {}, "Name": {}, "CreatedTime": {}, "UpdatedTime": {}, "DeletedTime": {},
+	"Id": {}, "ExternalId": {}, "Type": {}, "DisplayName": {}, "FirstName": {}, "LastName": {},
+	"Avatar": {}, "AvatarType": {}, "PermanentAvatar": {}, "Email": {}, "EmailVerified": {},
+	"Phone": {}, "CountryCode": {}, "Region": {}, "Location": {}, "Address": {}, "Affiliation": {},
+	"Title": {}, "IdCardType": {}, "IdCard": {}, "RealName": {}, "IsVerified": {}, "Homepage": {},
+	"Bio": {}, "Tag": {}, "Language": {}, "Gender": {}, "Birthday": {}, "Education": {},
+	"Score": {}, "Karma": {}, "Ranking": {}, "Balance": {}, "BalanceCredit": {}, "Currency": {},
+	"BalanceCurrency": {}, "IsDefaultAvatar": {}, "IsOnline": {}, "IsAdmin": {}, "IsForbidden": {},
+	"IsDeleted": {}, "SignupApplication": {}, "RegisterType": {}, "RegisterSource": {}, "CreatedIp": {},
+	"LastSigninTime": {}, "LastSigninIp": {}, "Groups": {}, "Roles": {}, "Permissions": {},
+	"permissionNames": {},
+}
+
+var reservedJwtClaimNames = map[string]struct{}{
+	"iss": {}, "sub": {}, "aud": {}, "exp": {}, "nbf": {}, "iat": {}, "jti": {},
+	"azp": {}, "nonce": {}, "scope": {}, "tokentype": {}, "cnf": {}, "client_id": {},
+	"provider": {}, "signinmethod": {}, "amr": {}, "acr": {}, "auth_time": {}, "sid": {},
+}
+
+func isReservedJwtClaimName(name string) bool {
+	_, ok := reservedJwtClaimNames[strings.ToLower(strings.TrimSpace(name))]
+	return ok
+}
+
+func isOAuthTokenProperty(name string) bool {
+	name = strings.ToLower(name)
+	// Casdoor stores provider credentials and provider-specific response data
+	// below the oauth_ namespace. Treat the namespace as credential-bearing by
+	// default instead of trying to maintain an incomplete suffix denylist.
+	return strings.HasPrefix(name, "oauth_")
+}
+
+func getTokenSafeProperties(properties map[string]string) map[string]string {
+	if properties == nil {
+		return map[string]string{}
+	}
+
+	res := make(map[string]string, len(properties))
+	for name, value := range properties {
+		if isOAuthTokenProperty(name) {
+			continue
+		}
+		res[name] = value
+	}
+	return res
+}
+
+// getUserFieldValue only returns fields explicitly approved for JWT-Custom.
+// The allowlist is a security boundary: adding a field to User must not make it
+// token-selectable by default.
 func getUserFieldValue(user *User, fieldName string) (interface{}, bool) {
 	if user == nil {
 		return nil, false
@@ -354,11 +465,15 @@ func getUserFieldValue(user *User, fieldName string) (interface{}, bool) {
 		return permissionNames, true
 	}
 
-	// Handle Properties fields (e.g., Properties.my_field)
+	// Individual custom properties are supported, but Casdoor's stored third-
+	// party OAuth credentials are never token-selectable.
 	if strings.HasPrefix(fieldName, "Properties.") {
-		parts := strings.Split(fieldName, ".")
+		parts := strings.SplitN(fieldName, ".", 2)
 		if len(parts) == 2 {
 			propName := parts[1]
+			if propName == "" || isOAuthTokenProperty(propName) {
+				return nil, false
+			}
 			if user.Properties != nil {
 				if value, exists := user.Properties[propName]; exists {
 					return value, true
@@ -368,7 +483,12 @@ func getUserFieldValue(user *User, fieldName string) (interface{}, bool) {
 		return nil, false
 	}
 
-	// Use reflection to get the field value
+	if _, ok := safeCustomTokenUserFields[fieldName]; !ok {
+		return nil, false
+	}
+
+	// Reflection is safe here because the field name has passed the explicit
+	// allowlist above.
 	userValue := reflect.ValueOf(user).Elem()
 	userField := userValue.FieldByName(fieldName)
 	if userField.IsValid() {
@@ -378,10 +498,8 @@ func getUserFieldValue(user *User, fieldName string) (interface{}, bool) {
 	return nil, false
 }
 
-func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtItem) jwt.MapClaims {
+func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtItem) (jwt.MapClaims, error) {
 	res := make(jwt.MapClaims)
-
-	userValue := reflect.ValueOf(claims.User).Elem()
 
 	// Always include standard JWT registered claims
 	res["iss"] = claims.RegisteredClaims.Issuer
@@ -403,6 +521,18 @@ func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtI
 	// Always include nonce and scope as they are built-in OAuth/OIDC fields (even if empty)
 	res["nonce"] = claims.Nonce
 	res["scope"] = claims.Scope
+	if len(claims.AuthenticationMethods) > 0 {
+		res["amr"] = slices.Clone(claims.AuthenticationMethods)
+	}
+	if claims.AuthTime > 0 {
+		res["auth_time"] = claims.AuthTime
+	}
+	if claims.Acr != "" {
+		res["acr"] = claims.Acr
+	}
+	if claims.Cnf != nil {
+		res["cnf"] = cloneDPoPConfirmation(claims.Cnf)
+	}
 
 	// Create a map for quick lookup of selected token fields
 	selectedFields := make(map[string]bool)
@@ -424,36 +554,33 @@ func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtI
 				Use selected properties fields as custom claims.
 				Converts `Properties.my_field` to custom claim with name `my_field`.
 			*/
-			parts := strings.Split(field, ".")
+			parts := strings.SplitN(field, ".", 2)
 			if len(parts) != 2 || parts[0] != "Properties" { // Either too many segments, or not properly scoped to `Properties`, so skip.
 				continue
 			}
-			base, fieldName := parts[0], parts[1]
-			mField := userValue.FieldByName(base)
-			if !mField.IsValid() { // Can't find `Properties` field, so skip.
-				continue
+			fieldName := parts[1]
+			if isReservedJwtClaimName(fieldName) {
+				return nil, fmt.Errorf("JWT-Custom property cannot override reserved claim %q", fieldName)
 			}
-			finalField := mField.MapIndex(reflect.ValueOf(fieldName))
-			if finalField.IsValid() { // // Provided field within `Properties` exists, add claim.
-				res[fieldName] = finalField.Interface()
+			if value, found := getUserFieldValue(claims.User, field); found {
+				res[fieldName] = value
 			}
-
-		} else if field == "permissionNames" {
-			permissionNames := []string{}
-			for _, val := range claims.User.Permissions {
-				permissionNames = append(permissionNames, val.Name)
-			}
-			res[util.SnakeToCamel(util.CamelToSnakeCase(field))] = permissionNames
-		} else { // Use selected user field as claims.
-			userField := userValue.FieldByName(field)
-			if userField.IsValid() {
+		} else if field != "signinMethod" && field != "provider" {
+			if value, found := getUserFieldValue(claims.User, field); found {
 				newfield := util.SnakeToCamel(util.CamelToSnakeCase(field))
-				res[newfield] = userField.Interface()
+				res[newfield] = value
 			}
 		}
 	}
 
 	for _, item := range tokenAttributes {
+		if item == nil {
+			continue
+		}
+		if isReservedJwtClaimName(item.Name) {
+			return nil, fmt.Errorf("JWT-Custom attribute cannot override reserved claim %q", item.Name)
+		}
+
 		var value interface{}
 
 		// If Category is "Existing Field", get the actual field value from the user
@@ -480,32 +607,70 @@ func getClaimsCustom(claims Claims, tokenField []string, tokenAttributes []*JwtI
 		res[item.Name] = value
 	}
 
-	return res
+	return res, nil
 }
 
 func refineUser(user *User) *User {
-	user.Password = ""
+	res := *user
+	res.Password = ""
+	res.PasswordSalt = ""
+	res.PasswordType = ""
+	res.Hash = ""
+	res.PreHash = ""
+	res.AccessToken = ""
+	res.OriginalToken = ""
+	res.OriginalRefreshToken = ""
+	res.TotpSecret = ""
+	res.RecoveryCodes = nil
+	res.WebauthnCredentials = nil
+	res.MultiFactorAuths = nil
+	res.FaceIds = nil
+	res.ManagedAccounts = nil
+	res.MfaAccounts = nil
+	res.MfaItems = nil
+	res.MfaRememberDeadline = ""
+	res.InvitationCode = ""
+	res.Properties = getTokenSafeProperties(user.Properties)
 
-	if user.Address == nil {
-		user.Address = []string{}
+	if res.Address == nil {
+		res.Address = []string{}
 	}
-	if user.Properties == nil {
-		user.Properties = map[string]string{}
+	if res.Properties == nil {
+		res.Properties = map[string]string{}
 	}
-	if user.Roles == nil {
-		user.Roles = []*Role{}
+	if res.Roles == nil {
+		res.Roles = []*Role{}
 	}
-	if user.Permissions == nil {
-		user.Permissions = []*Permission{}
+	if res.Permissions == nil {
+		res.Permissions = []*Permission{}
 	}
-	if user.Groups == nil {
-		user.Groups = []string{}
+	if res.Groups == nil {
+		res.Groups = []string{}
 	}
 
-	return user
+	return &res
 }
 
 func generateJwtToken(application *Application, user *User, provider string, signinMethod string, nonce string, scope string, resource string, host string) (string, string, string, error) {
+	return generateJwtTokenInternal(application, user, provider, signinMethod, nil, "", nonce, scope, resource, host)
+}
+
+func generateJwtTokenWithAuthenticationContext(application *Application, user *User, authenticationContext AuthenticationContext, nonce string, scope string, resource string, host string) (string, string, string, error) {
+	return generateJwtTokenWithAuthenticationContextAndDPoP(application, user, authenticationContext, "", nonce, scope, resource, host)
+}
+
+func generateJwtTokenWithAuthenticationContextAndDPoP(application *Application, user *User, authenticationContext AuthenticationContext, dpopJkt string, nonce string, scope string, resource string, host string, tokenNames ...string) (string, string, string, error) {
+	preserved, err := PreserveAuthenticationContext(authenticationContext)
+	if err != nil {
+		return "", "", "", err
+	}
+	if preserved.Subject != user.GetId() {
+		return "", "", "", fmt.Errorf("authentication context subject %q does not match user %q", preserved.Subject, user.GetId())
+	}
+	return generateJwtTokenInternal(application, user, preserved.Provider, "", &preserved, dpopJkt, nonce, scope, resource, host, tokenNames...)
+}
+
+func generateJwtTokenInternal(application *Application, user *User, provider string, signinMethod string, authenticationContext *AuthenticationContext, dpopJkt string, nonce string, scope string, resource string, host string, tokenNames ...string) (string, string, string, error) {
 	nowTime := time.Now()
 	expireTime := nowTime.Add(time.Duration(application.ExpireInHours * float64(time.Hour)))
 	refreshExpireTime := nowTime.Add(time.Duration(application.RefreshExpireInHours * float64(time.Hour)))
@@ -513,6 +678,7 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 		refreshExpireTime = expireTime
 	}
 
+	user = refineUser(user)
 	if conf.GetConfigBool("useGroupPathInToken") {
 		groupPath, err := user.GetUserFullGroupPath()
 		if err != nil {
@@ -521,11 +687,15 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 
 		user.Groups = groupPath
 	}
-	user = refineUser(user)
-
 	_, originBackend := getOriginFromHost(host)
 
-	name := util.GenerateId()
+	name := ""
+	if len(tokenNames) > 0 {
+		name = strings.TrimSpace(tokenNames[0])
+	}
+	if name == "" {
+		name = util.GenerateId()
+	}
 	jti := util.GetId(application.Owner, name)
 
 	claims := Claims{
@@ -548,6 +718,14 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 			ID:        jti,
 		},
 	}
+	if authenticationContext != nil {
+		claims.AuthenticationMethods = slices.Clone(authenticationContext.Amr)
+		claims.AuthTime = authenticationContext.AuthTime
+		claims.Acr = GetAuthenticationContextClass(authenticationContext.Amr)
+	}
+	if dpopJkt != "" {
+		claims.Cnf = &DPoPConfirmation{JKT: dpopJkt}
+	}
 
 	// RFC 8707: Use resource as audience when provided
 	if resource != "" {
@@ -557,7 +735,6 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 	}
 
 	var token *jwt.Token
-	var refreshToken *jwt.Token
 
 	if application.TokenFormat == "" {
 		application.TokenFormat = "JWT"
@@ -584,34 +761,27 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 		claimsWithoutThirdIdp := getClaimsWithoutThirdIdp(claims)
 
 		token = jwt.NewWithClaims(jwtMethod, claimsWithoutThirdIdp)
-		claimsWithoutThirdIdp.ExpiresAt = jwt.NewNumericDate(refreshExpireTime)
-		claimsWithoutThirdIdp.TokenType = "refresh-token"
-		refreshToken = jwt.NewWithClaims(jwtMethod, claimsWithoutThirdIdp)
 	} else if application.TokenFormat == "JWT-Empty" {
 		claimsShort := getShortClaims(claims)
 
 		token = jwt.NewWithClaims(jwtMethod, claimsShort)
-		claimsShort.ExpiresAt = jwt.NewNumericDate(refreshExpireTime)
-		claimsShort.TokenType = "refresh-token"
-		refreshToken = jwt.NewWithClaims(jwtMethod, claimsShort)
 	} else if application.TokenFormat == "JWT-Custom" {
-		claimsCustom := getClaimsCustom(claims, application.TokenFields, application.TokenAttributes)
+		claimsCustom, err := getClaimsCustom(claims, application.TokenFields, application.TokenAttributes)
+		if err != nil {
+			return "", "", "", err
+		}
 
 		token = jwt.NewWithClaims(jwtMethod, claimsCustom)
-		refreshClaims := getClaimsCustom(claims, application.TokenFields, application.TokenAttributes)
-		refreshClaims["exp"] = jwt.NewNumericDate(refreshExpireTime)
-		refreshClaims["TokenType"] = "refresh-token"
-		refreshToken = jwt.NewWithClaims(jwtMethod, refreshClaims)
 	} else if application.TokenFormat == "JWT-Standard" {
 		claimsStandard := getStandardClaims(claims)
 
 		token = jwt.NewWithClaims(jwtMethod, claimsStandard)
-		claimsStandard.ExpiresAt = jwt.NewNumericDate(refreshExpireTime)
-		claimsStandard.TokenType = "refresh-token"
-		refreshToken = jwt.NewWithClaims(jwtMethod, claimsStandard)
 	} else {
 		return "", "", "", fmt.Errorf("unknown application TokenFormat: %s", application.TokenFormat)
 	}
+
+	refreshClaims := getRefreshClaims(claims, refreshExpireTime)
+	refreshToken := jwt.NewWithClaims(jwtMethod, refreshClaims)
 
 	cert, err := getCertByApplication(application)
 	if err != nil {
@@ -646,7 +816,7 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 		return "", "", "", err
 	}
 
-	token.Header["kid"] = cert.Name
+	setJwtKeyID(cert.Name, token, refreshToken)
 	tokenString, err = token.SignedString(key)
 	if err != nil {
 		return "", "", "", err
@@ -654,6 +824,14 @@ func generateJwtToken(application *Application, user *User, provider string, sig
 	refreshTokenString, err = refreshToken.SignedString(key)
 
 	return tokenString, refreshTokenString, name, err
+}
+
+func setJwtKeyID(keyID string, tokens ...*jwt.Token) {
+	for _, token := range tokens {
+		if token != nil {
+			token.Header["kid"] = keyID
+		}
+	}
 }
 
 func ParseJwtTokenWithoutValidation(token string) (*jwt.Token, error) {
@@ -700,6 +878,56 @@ func ParseJwtToken(token string, cert *Cert) (*Claims, error) {
 	}
 
 	return nil, err
+}
+
+// ParseRefreshJwtToken validates and parses Casdoor's deliberately minimal
+// refresh-token shape. Parsing it as Claims or ClaimsStandard leaves the
+// embedded user pointer nil and makes downstream code prone to nil
+// dereferences, so refresh credentials always use this dedicated boundary.
+func ParseRefreshJwtToken(token string, cert *Cert) (*RefreshClaims, error) {
+	t, err := jwt.ParseWithClaims(token, &RefreshClaims{}, func(token *jwt.Token) (interface{}, error) {
+		var (
+			certificate interface{}
+			err         error
+		)
+
+		if cert == nil || cert.Certificate == "" {
+			return nil, fmt.Errorf("the certificate field should not be empty")
+		}
+
+		switch token.Method.(type) {
+		case *jwt.SigningMethodRSA:
+			certificate, err = jwt.ParseRSAPublicKeyFromPEM([]byte(cert.Certificate))
+		case *jwt.SigningMethodECDSA:
+			certificate, err = jwt.ParseECPublicKeyFromPEM([]byte(cert.Certificate))
+		default:
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		if err != nil {
+			return nil, err
+		}
+		return certificate, nil
+	})
+	if t != nil {
+		if claims, ok := t.Claims.(*RefreshClaims); ok && t.Valid {
+			if claims.TokenType != "refresh-token" {
+				return nil, fmt.Errorf("unexpected token type %q", claims.TokenType)
+			}
+			return claims, nil
+		}
+	}
+	if err == nil {
+		err = fmt.Errorf("invalid refresh token")
+	}
+	return nil, err
+}
+
+func ParseRefreshJwtTokenByApplication(token string, application *Application) (*RefreshClaims, error) {
+	cert, err := getCertByApplication(application)
+	if err != nil {
+		return nil, err
+	}
+	return ParseRefreshJwtToken(token, cert)
 }
 
 func ParseJwtTokenByApplication(token string, application *Application) (*Claims, error) {

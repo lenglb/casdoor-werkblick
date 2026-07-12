@@ -341,6 +341,10 @@ func (c *ApiController) UpdateUser() {
 		c.ResponseError(c.T("user:MFA phone is enabled but phone number is empty"))
 		return
 	}
+	if err = object.ValidateHardenedMfaItems(user.MfaItems); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 
 	if msg := object.CheckUpdateUser(oldUser, &user, c.GetAcceptLanguage()); msg != "" {
 		c.ResponseError(msg)
@@ -400,6 +404,10 @@ func (c *ApiController) AddUser() {
 	}
 
 	if err := checkQuotaForUser(); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if err = object.ValidateHardenedMfaItems(user.MfaItems); err != nil {
 		c.ResponseError(err.Error())
 		return
 	}

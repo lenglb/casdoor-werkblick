@@ -1,0 +1,134 @@
+name: Werkblick CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - "agent/**"
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: werkblick-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.25.8"
+  NODE_VERSION: "20.20.1"
+
+jobs:
+  backend:
+    name: Backend and security tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    services:
+      mysql:
+        image: mysql:5.7.44@sha256:4bc6bc963e6d8443453676cae56536f4b8156d78bae03c0145cbe47c2aad73bb
+        env:
+          MYSQL_DATABASE: casdoor
+          # Ephemeral CI-only credential matching the upstream test config.
+          MYSQL_ROOT_PASSWORD: "123456"
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+          check-latest: false
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Run security-sensitive packages with the race detector
+        run: go test -race -count=1 -tags skipCi ./controllers ./routers ./object
+
+      - name: Run complete Go test suite
+        run: go test -count=1 -tags skipCi ./...
+
+  frontend:
+    name: Frontend build and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          check-latest: false
+
+      - name: Activate pinned Yarn
+        run: |
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+          yarn --version
+
+      - name: Install locked dependencies
+        run: yarn install --frozen-lockfile --network-timeout 1000000
+
+      - name: Run provider-state unit tests
+        run: node --test src/auth/ProviderState.test.mjs
+
+      - name: Build production frontend
+        env:
+          CI: "false"
+        run: yarn run build
+
+  container:
+    name: Reproducible container build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    needs:
+      - backend
+      - frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Resolve deterministic build timestamp
+        id: source-date
+        shell: bash
+        run: echo "epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build hardened image without publishing
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile.werkblick
+          platforms: linux/amd64
+          push: false
+          pull: true
+          provenance: false
+          sbom: false
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.source-date.outputs.epoch }}
+          cache-from: type=gha,scope=werkblick-ci-image
+          cache-to: type=gha,mode=max,scope=werkblick-ci-image

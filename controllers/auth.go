@@ -25,13 +25,13 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/beego/beego/v2/server/web"
 	"github.com/casdoor/casdoor/captcha"
-	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/form"
 	"github.com/casdoor/casdoor/i18n"
 	"github.com/casdoor/casdoor/idp"
@@ -56,122 +56,154 @@ func tokenToResponse(token *object.Token) *Response {
 	return &Response{Status: "ok", Msg: "", Data: token.AccessToken, Data2: token.RefreshToken}
 }
 
-// HandleLoggedIn ...
-func (c *ApiController) HandleLoggedIn(application *object.Application, user *object.User, form *form.AuthForm) (resp *Response) {
+// validateAuthenticatedApplicationAccess contains the authorization gates that
+// must hold both immediately after primary authentication and again after a
+// delayed MFA enrollment. It intentionally performs no token/code issuance or
+// username-session promotion.
+func (c *ApiController) validateAuthenticatedApplicationAccess(application *object.Application, user *object.User) bool {
+	if application == nil || user == nil {
+		c.ResponseError("authenticated user or application is missing")
+		return false
+	}
 	if user.IsForbidden {
 		c.ResponseError(c.T("check:The user is forbidden to sign in, please contact the administrator"))
-		return
+		return false
 	}
-
 	if user.IsDeleted {
 		c.ResponseError(c.T("check:The user has been deleted and cannot be used to sign in, please contact the administrator"))
-		return
+		return false
 	}
 
 	userId := user.GetId()
-
 	clientIp := util.GetClientIpFromRequest(c.Ctx.Request)
-	err := object.CheckEntryIp(clientIp, user, application, application.OrganizationObj, c.GetAcceptLanguage())
-	if err != nil {
+	if err := object.CheckEntryIp(clientIp, user, application, application.OrganizationObj, c.GetAcceptLanguage()); err != nil {
 		c.ResponseError(err.Error())
-		return
+		return false
 	}
-
 	if application.DisableSignin {
 		c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s has disabled users to signin"), application.Name))
-		return
+		return false
 	}
-
 	if application.OrganizationObj != nil && application.OrganizationObj.DisableSignin {
 		c.ResponseError(fmt.Sprintf(c.T("auth:The organization: %s has disabled users to signin"), application.Organization))
-		return
+		return false
 	}
-
 	allowed, err := object.CheckLoginPermission(userId, application)
 	if err != nil {
 		c.ResponseError(err.Error(), nil)
-		return
+		return false
 	}
 	if !allowed {
 		c.ResponseError(c.T("auth:Unauthorized operation"))
-		return
+		return false
+	}
+	if !user.IsGlobalAdmin() && !user.IsAdmin && len(application.Tags) > 0 && !util.HasTagInSlice(application.Tags, user.Tag) {
+		c.ResponseError(fmt.Sprintf(c.T("auth:User's tag: %s is not listed in the application's tags"), user.Tag))
+		return false
 	}
 
-	// check user's tag
-	if !user.IsGlobalAdmin() && !user.IsAdmin && len(application.Tags) > 0 {
-		// only users with the tag that is listed in the application tags can login
-		// supports comma-separated tags in user.Tag (e.g., "default-policy,project-admin")
-		if !util.HasTagInSlice(application.Tags, user.Tag) {
-			c.ResponseError(fmt.Sprintf(c.T("auth:User's tag: %s is not listed in the application's tags"), user.Tag))
-			return
-		}
-	}
-
-	// check whether paid-user have active subscription
 	if user.Type == "paid-user" {
 		subscriptions, err := object.GetSubscriptionsByUser(user.Owner, user.Name)
 		if err != nil {
 			c.ResponseError(err.Error())
-			return
+			return false
 		}
-		existActiveSubscription := false
 		for _, subscription := range subscriptions {
 			if subscription.State == object.SubStateActive {
-				existActiveSubscription = true
-				break
+				return true
 			}
 		}
-		if !existActiveSubscription {
-			// check pending subscription
-			for _, sub := range subscriptions {
-				if sub.State == object.SubStatePending {
-					c.ResponseOk("BuyPlanResult", sub)
-					return
-				}
+		for _, subscription := range subscriptions {
+			if subscription.State == object.SubStatePending {
+				c.ResponseOk("BuyPlanResult", subscription)
+				return false
 			}
-			// paid-user does not have active or pending subscription, find the default pricing of application
-			pricing, err := object.GetApplicationDefaultPricing(application.Organization, application.Name)
-			if err != nil {
-				c.ResponseError(err.Error())
-				return
-			}
-			if pricing == nil {
-				c.ResponseError(fmt.Sprintf(c.T("auth:paid-user %s does not have active or pending subscription and the application: %s does not have default pricing"), user.Name, application.Name))
-				return
-			} else {
-				c.SetSession("paidUsername", user.GetId())
-				// let the paid-user select plan
-				c.ResponseOk("SelectPlan", pricing)
-				return
-			}
-
 		}
+		pricing, err := object.GetApplicationDefaultPricing(application.Organization, application.Name)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return false
+		}
+		if pricing == nil {
+			c.ResponseError(fmt.Sprintf(c.T("auth:paid-user %s does not have active or pending subscription and the application: %s does not have default pricing"), user.Name, application.Name))
+			return false
+		}
+		c.SetSession("paidUsername", user.GetId())
+		c.ResponseOk("SelectPlan", pricing)
+		return false
 	}
+	return true
+}
+
+// HandleLoggedIn ...
+func (c *ApiController) HandleLoggedIn(application *object.Application, user *object.User, form *form.AuthForm) (resp *Response) {
+	defer func() {
+		if resp == nil || resp.Status != "ok" {
+			c.clearPendingAuthentication()
+		}
+	}()
+
+	if !c.validateAuthenticatedApplicationAccess(application, user) {
+		return
+	}
+	userId := user.GetId()
 
 	if form.Type == ResponseTypeLogin {
 		c.SetSessionUsername(userId)
 		util.LogInfo(c.Ctx, "API: [%s] signed in", userId)
 		resp = &Response{Status: "ok", Msg: "", Data: userId, Data3: user.NeedUpdatePassword}
 	} else if form.Type == ResponseTypeCode {
-		clientId := c.Ctx.Input.Query("clientId")
-		responseType := c.Ctx.Input.Query("responseType")
-		redirectUri := c.Ctx.Input.Query("redirectUri")
-		scope := c.Ctx.Input.Query("scope")
-		state := c.Ctx.Input.Query("state")
-		nonce := c.Ctx.Input.Query("nonce")
-		challengeMethod := c.Ctx.Input.Query("code_challenge_method")
-		codeChallenge := c.Ctx.Input.Query("code_challenge")
-		resource := c.Ctx.Input.Query("resource")
-
-		if challengeMethod != "S256" && challengeMethod != "null" && challengeMethod != "" {
-			c.ResponseError(c.T("auth:Challenge method should be S256"))
+		authenticationContext, err := c.getCurrentAuthenticationContext()
+		if err != nil {
+			c.ResponseError(fmt.Sprintf("authentication context is required: %s", err.Error()))
 			return
 		}
 
-		consentRequired, err := object.CheckConsentRequired(user, application, scope)
+		authorizationRequest, err := c.captureAuthorizationRequest()
 		if err != nil {
 			c.ResponseError(err.Error())
 			return
+		}
+		pending, pendingErr := c.getPendingAuthentication()
+		if pendingErr != nil {
+			c.ResponseError(fmt.Sprintf("pending authentication is required: %s", pendingErr.Error()))
+			return
+		}
+		if pending.Context.Subject != userId || !pending.Context.Equal(authenticationContext) {
+			c.ResponseError("pending authentication does not match signed-in authentication context")
+			return
+		}
+		if pending.FlowType != ResponseTypeCode || pending.ApplicationId != application.GetId() {
+			c.ResponseError("pending authentication does not match OAuth application flow")
+			return
+		}
+		if pending.Request == nil {
+			c.ResponseError("pending OAuth authorization request is missing")
+			return
+		}
+		if !authorizationRequest.Equal(*pending.Request) {
+			c.ResponseError("OAuth authorization request does not match pending authentication")
+			return
+		}
+		authenticationContext = pending.Context
+		authorizationRequest = pending.Request.Clone()
+		if application.ClientId != authorizationRequest.ClientId {
+			c.ResponseError("OAuth client does not match the authenticated application")
+			return
+		}
+
+		consentRequired, err := object.CheckConsentRequired(user, application, authorizationRequest.Scope)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		prompts, err := authorizationRequest.PromptValues()
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if slices.Contains(prompts, "consent") {
+			consentRequired = true
 		}
 
 		needSigninSession := application.EnableSigninSession || application.HasPromptPage() || consentRequired
@@ -184,7 +216,20 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 			resp = &Response{Status: "ok", Data: map[string]bool{"required": true}}
 			resp.Data3 = user.NeedUpdatePassword
 		} else {
-			code, err := object.GetOAuthCode(userId, clientId, form.Provider, form.SigninMethod, responseType, redirectUri, scope, state, nonce, codeChallenge, resource, c.Ctx.Request.Host, c.GetAcceptLanguage())
+			code, err := object.GetOAuthCodeWithAuthenticationContext(
+				userId,
+				authorizationRequest.ClientId,
+				authenticationContext,
+				authorizationRequest.ResponseType,
+				authorizationRequest.RedirectUri,
+				authorizationRequest.Scope,
+				authorizationRequest.State,
+				authorizationRequest.Nonce,
+				authorizationRequest.CodeChallenge,
+				authorizationRequest.Resource,
+				c.Ctx.Request.Host,
+				c.GetAcceptLanguage(),
+			)
 			if err != nil {
 				c.ResponseError(err.Error(), nil)
 				return
@@ -192,6 +237,9 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 
 			resp = codeToResponse(code)
 			resp.Data3 = user.NeedUpdatePassword
+			if resp.Status == "ok" {
+				c.clearPendingAuthentication()
+			}
 		}
 	} else if form.Type == ResponseTypeToken || form.Type == ResponseTypeIdToken { // implicit flow
 		if !object.IsGrantTypeValid(form.Type, application.GrantTypes) {
@@ -203,20 +251,44 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 			if !valid {
 				resp = &Response{Status: "error", Msg: "error: invalid_scope", Data: ""}
 			} else {
-				token, _ := object.GetTokenByUser(application, user, expandedScope, nonce, c.Ctx.Request.Host)
+				authenticationContext, contextErr := c.getCurrentAuthenticationContext()
+				if contextErr != nil || authenticationContext.Subject != userId {
+					resp = &Response{Status: "error", Msg: "error: verified authentication context is required", Data: ""}
+					return
+				}
+				token, tokenErr := object.GetTokenByUserWithAuthenticationContext(application, user, expandedScope, nonce, c.Ctx.Request.Host, authenticationContext)
+				if tokenErr != nil {
+					resp = &Response{Status: "error", Msg: tokenErr.Error(), Data: ""}
+					return
+				}
 				resp = tokenToResponse(token)
 
 				resp.Data3 = user.NeedUpdatePassword
 			}
 		}
 	} else if form.Type == ResponseTypeDevice {
+		pendingUserCodeCache, ok := object.DeviceAuthMap.Load(form.UserCode)
+		if !ok {
+			c.ResponseError(c.T("auth:UserCode Expired"))
+			return
+		}
+		pendingUserCodeCacheCast, ok := pendingUserCodeCache.(object.DeviceAuthCache)
+		if !ok || pendingUserCodeCacheCast.ApplicationId != application.GetId() || pendingUserCodeCacheCast.ClientId != application.ClientId {
+			c.ResponseError(c.T("auth:The application does not match the device authorization request"))
+			return
+		}
+
 		authCache, ok := object.DeviceAuthMap.LoadAndDelete(form.UserCode)
 		if !ok {
 			c.ResponseError(c.T("auth:UserCode Expired"))
 			return
 		}
 
-		authCacheCast := authCache.(object.DeviceAuthCache)
+		authCacheCast, ok := authCache.(object.DeviceAuthCache)
+		if !ok || authCacheCast.ApplicationId != application.GetId() || authCacheCast.ClientId != application.ClientId {
+			c.ResponseError(c.T("auth:The application does not match the device authorization request"))
+			return
+		}
 		if authCacheCast.Status == object.DeviceAuthStatusDenied {
 			if authCacheCast.UserName != "" {
 				object.DeviceAuthMap.Delete(authCacheCast.UserName)
@@ -243,10 +315,24 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 			return
 		}
 
-		deviceAuthCacheDeviceCodeCast := deviceAuthCacheDeviceCode.(object.DeviceAuthCache)
+		deviceAuthCacheDeviceCodeCast, ok := deviceAuthCacheDeviceCode.(object.DeviceAuthCache)
+		if !ok ||
+			deviceAuthCacheDeviceCodeCast.ApplicationId != application.GetId() ||
+			deviceAuthCacheDeviceCodeCast.ClientId != application.ClientId ||
+			deviceAuthCacheDeviceCodeCast.ApplicationId != authCacheCast.ApplicationId ||
+			deviceAuthCacheDeviceCodeCast.ClientId != authCacheCast.ClientId {
+			c.ResponseError(c.T("auth:The application does not match the device authorization request"))
+			return
+		}
 		deviceAuthCacheDeviceCodeCast.UserName = user.Name
 		deviceAuthCacheDeviceCodeCast.UserSignIn = true
 		deviceAuthCacheDeviceCodeCast.Status = object.DeviceAuthStatusApproved
+		authenticationContext, contextErr := c.getCurrentAuthenticationContext()
+		if contextErr != nil || authenticationContext.Subject != userId {
+			c.ResponseError("verified authentication context is required for device authorization")
+			return
+		}
+		deviceAuthCacheDeviceCodeCast.AuthenticationContext = authenticationContext
 
 		object.DeviceAuthMap.Store(authCacheCast.UserName, deviceAuthCacheDeviceCodeCast)
 
@@ -286,6 +372,9 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 
 	// For all successful logins, set the session expiration; if auto signin is not checked, cap it at 24 hours.
 	if resp.Status == "ok" {
+		if form.Type != ResponseTypeCode {
+			c.clearPendingAuthentication()
+		}
 		expireInHours := application.CookieExpireInHours
 
 		if expireInHours == 0 {
@@ -317,7 +406,7 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 			}
 		}
 
-		_, err = object.AddSession(&object.Session{
+		_, err := object.AddSession(&object.Session{
 			Owner:       user.Owner,
 			Name:        user.Name,
 			Application: application.Name,
@@ -399,6 +488,10 @@ func (c *ApiController) GetApplicationLogin() {
 	object.CheckEntryIp(clientIp, nil, application, nil, c.GetAcceptLanguage())
 
 	application = object.GetMaskedApplication(application, "")
+	if err = c.attachProviderStates(application); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 	if msg != "" {
 		c.ResponseError(msg, application)
 	} else {
@@ -437,35 +530,104 @@ func isProxyProviderType(providerType string) bool {
 	return false
 }
 
+func isSupportedMfaAuthenticationType(mfaType string) bool {
+	// TOTP is locally verified and RADIUS uses a server-stored provider binding.
+	// SMS/email verification records are not purpose-bound or atomically
+	// consumed, and Push has no verifiable approval callback yet.
+	return mfaType == object.TotpType || mfaType == object.RadiusType
+}
+
+func getMissingRequiredMfaTypes(organization *object.Organization, user *object.User) []string {
+	if organization == nil || user == nil {
+		return nil
+	}
+	items := organization.MfaItems
+	if len(user.MfaItems) > 0 {
+		items = user.MfaItems
+	}
+	res := []string{}
+	for _, item := range items {
+		if item != nil && object.IsRequiredMfaType(organization, user, item.Name) && !slices.Contains(res, item.Name) {
+			res = append(res, item.Name)
+		}
+	}
+	return res
+}
+
 func checkMfaEnable(c *ApiController, user *object.User, organization *object.Organization, verificationType string) bool {
 	if object.IsNeedPromptMfa(organization, user) {
-		// The prompt page needs the user to be signed in
-		c.SetSessionUsername(user.GetId())
+		pending, err := c.getPendingAuthentication()
+		if err != nil {
+			c.ResponseError(err.Error())
+			return true
+		}
+		if pending.FlowType != ResponseTypeLogin && pending.FlowType != ResponseTypeCode {
+			c.ClearUserSession()
+			c.ResponseError("Required MFA enrollment supports login and authorization-code flows only; authenticate again after enrollment")
+			return true
+		}
+		for _, requiredType := range getMissingRequiredMfaTypes(organization, user) {
+			if !isSupportedMfaSetupType(requiredType) {
+				c.ClearUserSession()
+				c.ResponseError(fmt.Sprintf("Required MFA type %q is not supported by the hardened enrollment flow; an administrator must migrate the policy to TOTP", requiredType))
+				return true
+			}
+		}
+		// Required MFA enrollment is an authentication continuation, not a
+		// signed-in Casdoor session. Only the MFA setup endpoints may use this
+		// restricted identity until enrollment has been verified and promoted.
+		if err := c.SessionRegenerateID(); err != nil {
+			c.ResponseError(fmt.Sprintf("regenerate MFA setup session: %s", err.Error()))
+			return true
+		}
+		if err := c.SetSession("username", ""); err != nil {
+			c.ResponseError(err.Error())
+			return true
+		}
+		if err := c.setMfaUserSession(""); err != nil {
+			c.ResponseError(err.Error())
+			return true
+		}
+		if err := c.setMfaSetupUserSession(user.GetId()); err != nil {
+			c.ResponseError(err.Error())
+			return true
+		}
+		c.Ctx.Input.CruSession.SessionRelease(context.Background(), c.Ctx.ResponseWriter)
 		c.ResponseOk(object.RequiredMfa)
 		return true
 	}
 
 	if user.IsMfaEnabled() {
-		currentTime := util.String2Time(util.GetCurrentTime())
-		mfaRememberDeadline := util.String2Time(user.MfaRememberDeadline)
-		if user.MfaRememberDeadline != "" && mfaRememberDeadline.After(currentTime) {
-			return false
-		}
-		c.setMfaUserSession(user.GetId())
 		mfaList := object.GetAllMfaProps(user, true)
 		mfaAllowList := []*object.MfaProps{}
 		mfaRememberInHours := organization.MfaRememberInHours
+		hasEnabledFactor := false
 		for _, prop := range mfaList {
-			if prop.MfaType == verificationType || !prop.Enabled {
+			if !prop.Enabled {
+				continue
+			}
+			hasEnabledFactor = true
+			if prop.MfaType == verificationType || !isSupportedMfaAuthenticationType(prop.MfaType) {
 				continue
 			}
 			prop.MfaRememberInHours = mfaRememberInHours
 			mfaAllowList = append(mfaAllowList, prop)
 		}
 		if len(mfaAllowList) >= 1 {
-			c.SetSession("verificationCodeType", verificationType)
+			if err := c.setMfaUserSession(user.GetId()); err != nil {
+				c.ResponseError(err.Error())
+				return true
+			}
+			if err := c.SetSession("verificationCodeType", verificationType); err != nil {
+				c.ResponseError(err.Error())
+				return true
+			}
 			c.Ctx.Input.CruSession.SessionRelease(context.Background(), c.Ctx.ResponseWriter)
 			c.ResponseOk(object.NextMfa, mfaAllowList)
+			return true
+		}
+		if hasEnabledFactor {
+			c.ResponseError("An independent TOTP or administrator-provisioned RADIUS factor is required")
 			return true
 		}
 	}
@@ -568,6 +730,7 @@ func (c *ApiController) Login() {
 
 	if authForm.Username != "" {
 		var user *object.User
+		var authenticationMethods []string
 		if authForm.SigninMethod == "Face ID" {
 			var application *object.Application
 			application, err = object.GetApplication(fmt.Sprintf("admin/%s", authForm.Application))
@@ -622,6 +785,7 @@ func (c *ApiController) Login() {
 					return
 				}
 			}
+			authenticationMethods = []string{"face"}
 		} else if authForm.Password == "" {
 			var application *object.Application
 			application, err = object.GetApplication(fmt.Sprintf("admin/%s", authForm.Application))
@@ -702,6 +866,7 @@ func (c *ApiController) Login() {
 					}
 				}
 			}
+			authenticationMethods = []string{verificationType}
 		} else {
 			var application *object.Application
 			application, err = object.GetApplication(fmt.Sprintf("admin/%s", authForm.Application))
@@ -784,6 +949,9 @@ func (c *ApiController) Login() {
 			}
 
 			user, err = object.CheckUserPassword(authForm.Organization, authForm.Username, password, c.GetAcceptLanguage(), enableCaptcha, isSigninViaLdap, isPasswordWithLdapEnabled)
+			if err == nil {
+				authenticationMethods, err = object.GetVerifiedPasswordAuthenticationMethods(user, password)
+			}
 		}
 
 		if err != nil {
@@ -806,13 +974,29 @@ func (c *ApiController) Login() {
 				return
 			}
 
+			authenticationContext, contextErr := c.beginAuthentication(user, authenticationMethods, "", authForm.Type, application, authForm.UserCode)
+			if contextErr != nil {
+				c.ResponseError(contextErr.Error())
+				return
+			}
+
 			var organization *object.Organization
 			organization, err = object.GetOrganizationByUser(user)
 			if err != nil {
 				c.ResponseError(err.Error())
+				return
+			}
+			if organization == nil {
+				c.ResponseError("organization does not exist")
+				return
 			}
 
 			if checkMfaEnable(c, user, organization, verificationType) {
+				return
+			}
+
+			if contextErr = c.completeAuthentication(authenticationContext); contextErr != nil {
+				c.ResponseError(contextErr.Error())
 				return
 			}
 
@@ -840,11 +1024,15 @@ func (c *ApiController) Login() {
 			c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), authForm.Application))
 			return
 		}
-
 		var organization *object.Organization
 		organization, err = object.GetOrganization(util.GetId("admin", application.Organization))
 		if err != nil {
 			c.ResponseError(c.T(err.Error()))
+			return
+		}
+		if organization == nil {
+			c.ResponseError("organization does not exist")
+			return
 		}
 
 		var provider *object.Provider
@@ -874,6 +1062,10 @@ func (c *ApiController) Login() {
 			}
 		} else if provider.Category == "OAuth" || provider.Category == "Web3" {
 			// OAuth
+			if err = c.consumeProviderState(authForm.State, application.GetId(), provider.Name, authForm.Method); err != nil {
+				c.ResponseError(err.Error())
+				return
+			}
 			idpInfo, err := object.FromProviderToIdpInfo(c.Ctx, provider)
 			if err != nil {
 				c.ResponseError(err.Error())
@@ -892,12 +1084,6 @@ func (c *ApiController) Login() {
 			}
 
 			setHttpClient(idProvider, provider)
-
-			stateApplicationName := strings.Split(authForm.State, "-org-")[0]
-			if authForm.State != conf.GetConfigString("authState") && stateApplicationName != application.Name {
-				c.ResponseError(fmt.Sprintf(c.T("auth:State expected: %s, but got: %s"), conf.GetConfigString("authState"), authForm.State))
-				return
-			}
 
 			// https://github.com/golang/oauth2/issues/123#issuecomment-103715338
 			token, err = idProvider.GetToken(authForm.Code)
@@ -955,7 +1141,16 @@ func (c *ApiController) Login() {
 					return
 				}
 
+				authenticationContext, contextErr := c.beginAuthentication(user, []string{"federated"}, provider.Name, authForm.Type, application, authForm.UserCode)
+				if contextErr != nil {
+					c.ResponseError(contextErr.Error())
+					return
+				}
 				if checkMfaEnable(c, user, organization, verificationType) {
+					return
+				}
+				if contextErr = c.completeAuthentication(authenticationContext); contextErr != nil {
+					c.ResponseError(contextErr.Error())
 					return
 				}
 
@@ -1105,6 +1300,18 @@ func (c *ApiController) Login() {
 					return
 				}
 
+				authenticationContext, contextErr := c.beginAuthentication(user, []string{"federated"}, provider.Name, authForm.Type, application, authForm.UserCode)
+				if contextErr != nil {
+					c.ResponseError(contextErr.Error())
+					return
+				}
+				if checkMfaEnable(c, user, organization, verificationType) {
+					return
+				}
+				if contextErr = c.completeAuthentication(authenticationContext); contextErr != nil {
+					c.ResponseError(contextErr.Error())
+					return
+				}
 				resp = c.HandleLoggedIn(application, user, &authForm)
 
 				c.Ctx.Input.SetParam("recordUserId", user.GetId())
@@ -1171,6 +1378,34 @@ func (c *ApiController) Login() {
 			c.ResponseError("expired user session")
 			return
 		}
+		pendingAuthentication, err := c.getPendingAuthentication()
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if pendingAuthentication.Context.Subject != user.GetId() {
+			c.ResponseError("pending authentication subject does not match MFA user")
+			return
+		}
+		if authForm.Type != pendingAuthentication.FlowType {
+			c.ResponseError("authentication flow type does not match pending MFA authentication")
+			return
+		}
+		if authForm.UserCode != pendingAuthentication.UserCode {
+			c.ResponseError("device user code does not match pending MFA authentication")
+			return
+		}
+		if pendingAuthentication.Request != nil {
+			currentRequest, requestErr := c.captureAuthorizationRequest()
+			if requestErr != nil {
+				c.ResponseError(requestErr.Error())
+				return
+			}
+			if !currentRequest.Equal(*pendingAuthentication.Request) {
+				c.ResponseError("OAuth authorization request does not match pending MFA authentication")
+				return
+			}
+		}
 
 		var application *object.Application
 		if authForm.ClientId == "" {
@@ -1187,13 +1422,28 @@ func (c *ApiController) Login() {
 			c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), authForm.Application))
 			return
 		}
+		if application.GetId() != pendingAuthentication.ApplicationId {
+			c.ResponseError("application does not match pending MFA authentication")
+			return
+		}
+		if pendingAuthentication.Request != nil &&
+			application.ClientId != pendingAuthentication.Request.ClientId {
+			c.ResponseError("OAuth client does not match pending authentication")
+			return
+		}
 
 		var organization *object.Organization
 		organization, err = object.GetOrganization(util.GetId("admin", application.Organization))
 		if err != nil {
 			c.ResponseError(c.T(err.Error()))
+			return
+		}
+		if organization == nil {
+			c.ResponseError("organization does not exist")
+			return
 		}
 
+		additionalAuthenticationMethod := ""
 		if authForm.Passcode != "" {
 			if authForm.MfaType == c.GetSession("verificationCodeType") {
 				c.ResponseError("Invalid multi-factor authentication type")
@@ -1219,19 +1469,18 @@ func (c *ApiController) Login() {
 					c.ResponseError(err.Error())
 					return
 				}
-			}
-
-			if authForm.EnableMfaRemember {
-				mfaRememberInSeconds := organization.MfaRememberInHours * 3600
-				currentTime := util.String2Time(util.GetCurrentTime())
-				duration := time.Duration(mfaRememberInSeconds) * time.Second
-				user.MfaRememberDeadline = util.Time2String(currentTime.Add(duration))
-				_, err = object.UpdateUser(user.GetId(), user, []string{"mfa_remember_deadline"}, user.IsAdmin)
+				additionalAuthenticationMethod, err = mfaAuthenticationMethod(authForm.MfaType)
 				if err != nil {
 					c.ResponseError(err.Error())
 					return
 				}
+			} else {
+				additionalAuthenticationMethod = "master_verification_code"
 			}
+
+			// The legacy MfaRememberDeadline is a global user field and therefore
+			// suppresses MFA on every browser and client. It is intentionally not
+			// written or trusted by the hardened authentication flow.
 			c.SetSession("verificationCodeType", "")
 		} else if authForm.RecoveryCode != "" {
 			err = object.MfaRecover(user, authForm.RecoveryCode)
@@ -1240,8 +1489,24 @@ func (c *ApiController) Login() {
 				c.ResponseError(err.Error())
 				return
 			}
+			additionalAuthenticationMethod = "recovery"
 		} else {
 			c.ResponseError("missing passcode or recovery code")
+			return
+		}
+
+		authenticationContext, err := appendAuthenticationMethod(pendingAuthentication.Context, additionalAuthenticationMethod)
+		if err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		if err = c.completeAuthentication(authenticationContext); err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
+		pendingAuthentication.Context = authenticationContext
+		if err = c.setPendingAuthentication(pendingAuthentication); err != nil {
+			c.ResponseError(err.Error())
 			return
 		}
 
@@ -1269,6 +1534,37 @@ func (c *ApiController) Login() {
 			}
 
 			user := c.getCurrentUser()
+			authenticationContext, contextErr := c.getCurrentAuthenticationContext()
+			if contextErr != nil {
+				c.ResponseError("fresh authentication is required")
+				return
+			}
+			if user == nil || authenticationContext.Subject != user.GetId() {
+				c.ResponseError("authentication context does not match signed-in user")
+				return
+			}
+			if authForm.Type == ResponseTypeCode {
+				authorizationRequest, requestErr := c.captureAuthorizationRequest()
+				if requestErr != nil {
+					c.ResponseError(requestErr.Error())
+					return
+				}
+				if authorizationRequest.RequiresFreshAuthentication(authenticationContext, time.Now().Unix()) {
+					c.ResponseError("fresh authentication is required")
+					return
+				}
+				pendingAuthentication := newPendingAuthentication(
+					authenticationContext,
+					ResponseTypeCode,
+					application,
+					"",
+					&authorizationRequest,
+				)
+				if contextErr = c.setPendingAuthentication(pendingAuthentication); contextErr != nil {
+					c.ResponseError(contextErr.Error())
+					return
+				}
+			}
 			resp = c.HandleLoggedIn(application, user, &authForm)
 
 			c.Ctx.Input.SetParam("recordUserId", user.GetId())
@@ -1583,6 +1879,7 @@ func (c *ApiController) DeviceAuth() {
 		UserName:      deviceCode,
 		Scope:         scope,
 		ApplicationId: application.GetId(),
+		ClientId:      application.ClientId,
 		RequestAt:     time.Now(),
 		Status:        object.DeviceAuthStatusPending,
 		CancelToken:   cancelToken,
@@ -1678,6 +1975,15 @@ func (c *ApiController) DeviceAuthComplete() {
 		c.ResponseError(fmt.Sprintf(c.T("general:The user: %s doesn't exist"), deviceAuthCache.UserName))
 		return
 	}
+	authenticationContext, contextErr := object.PreserveAuthenticationContext(deviceAuthCache.AuthenticationContext)
+	if contextErr != nil || authenticationContext.Subject != user.GetId() {
+		c.ResponseError(c.T("auth:Verified authentication context is missing"))
+		return
+	}
+	if contextErr = c.completeAuthentication(authenticationContext); contextErr != nil {
+		c.ResponseError(contextErr.Error())
+		return
+	}
 
 	responseType := c.Ctx.Input.Query("responseType")
 	if responseType == "" {
@@ -1704,6 +2010,22 @@ func (c *ApiController) DeviceAuthComplete() {
 					}
 				}
 			}
+		}
+		authorizationRequest, requestErr := c.captureAuthorizationRequest()
+		if requestErr != nil {
+			c.ResponseError(requestErr.Error())
+			return
+		}
+		pendingAuthentication := newPendingAuthentication(
+			authenticationContext,
+			responseType,
+			application,
+			"",
+			&authorizationRequest,
+		)
+		if contextErr = c.setPendingAuthentication(pendingAuthentication); contextErr != nil {
+			c.ResponseError(contextErr.Error())
+			return
 		}
 	}
 

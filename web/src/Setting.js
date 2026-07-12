@@ -2101,6 +2101,75 @@ export function getUserCommonFields() {
     "WebauthnCredentials", "FaceIds", "Invitation", "InvitationCode", "Ldap", "Properties", "Groups"];
 }
 
+// Keep these lists aligned with safeCustomTokenUserFields and
+// reservedJwtClaimNames in object/token_jwt.go. They are a UI boundary only;
+// the backend remains the authoritative security boundary.
+const jwtTokenFields = ["Owner", "Name", "CreatedTime", "UpdatedTime", "DeletedTime", "Id", "ExternalId", "Type", "DisplayName", "FirstName", "LastName", "Avatar", "AvatarType", "PermanentAvatar",
+  "Email", "EmailVerified", "Phone", "CountryCode", "Location", "Address", "Affiliation", "Title", "IdCardType", "IdCard", "RealName", "IsVerified", "Homepage", "Bio", "Tag", "Region",
+  "Language", "Gender", "Birthday", "Education", "Score", "Karma", "Ranking", "Balance", "BalanceCredit", "Currency", "BalanceCurrency", "IsDefaultAvatar", "IsOnline", "IsAdmin", "IsForbidden", "IsDeleted",
+  "SignupApplication", "RegisterType", "RegisterSource", "CreatedIp", "LastSigninTime", "LastSigninIp", "Groups", "Roles", "Permissions", "permissionNames"];
+const jwtBuiltInTokenFields = new Set(["signinMethod", "provider"]);
+const reservedJwtClaimNames = new Set([
+  "iss", "sub", "aud", "exp", "nbf", "iat", "jti", "azp", "nonce", "scope",
+  "tokentype", "cnf", "client_id", "provider", "signinmethod", "amr", "acr", "auth_time", "sid",
+]);
+
+export function getJwtTokenFields() {
+  return [...jwtTokenFields];
+}
+
+export function isReservedJwtClaimName(name) {
+  return reservedJwtClaimNames.has(String(name ?? "").trim().toLowerCase());
+}
+
+function isOAuthTokenPropertyName(name) {
+  const normalized = String(name ?? "").toLowerCase();
+  return normalized.startsWith("oauth_");
+}
+
+export function isSafeJwtTokenField(field, includeBuiltInFields = true) {
+  const normalized = String(field ?? "").trim();
+  if (jwtTokenFields.includes(normalized)) {
+    return true;
+  }
+  if (includeBuiltInFields && jwtBuiltInTokenFields.has(normalized)) {
+    return true;
+  }
+  if (!normalized.startsWith("Properties.")) {
+    return false;
+  }
+
+  const propertyName = normalized.slice("Properties.".length);
+  return propertyName !== "" && !isReservedJwtClaimName(propertyName) && !isOAuthTokenPropertyName(propertyName);
+}
+
+export function validateJwtTokenConfiguration(application) {
+  if (!application || application.tokenFormat !== "JWT-Custom") {
+    return {ok: true, issues: []};
+  }
+
+  const issues = [];
+  (application.tokenFields || []).forEach((field) => {
+    if (!isSafeJwtTokenField(field)) {
+      issues.push(`unsafe token field "${field}"`);
+    }
+  });
+  (application.tokenAttributes || []).forEach((attribute, index) => {
+    const name = String(attribute?.name ?? "").trim();
+    if (name === "") {
+      issues.push(`token attribute ${index + 1} has no name`);
+    } else if (isReservedJwtClaimName(name)) {
+      issues.push(`token attribute "${name}" overrides a reserved claim`);
+    }
+
+    if (attribute?.category === "Existing Field" && !isSafeJwtTokenField(attribute.value, false)) {
+      issues.push(`token attribute "${name || index + 1}" uses unsafe field "${attribute?.value || ""}"`);
+    }
+  });
+
+  return {ok: issues.length === 0, issues: issues};
+}
+
 export function getDefaultFooterContent() {
   return `Powered by <a target="_blank" href="https://casdoor.org" rel="noreferrer"><img style="padding-bottom: 3px" height="20" alt="Casdoor" src="${StaticBaseUrl}/img/casdoor-logo_1185x256.png"/></a>`;
 }

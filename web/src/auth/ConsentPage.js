@@ -30,6 +30,7 @@ class ConsentPage extends React.Component {
       applicationName: props.match?.params?.applicationName || params.get("application"),
       scopeDescriptions: [],
       granting: false,
+      denying: false,
       oAuthParams: Util.getOAuthGetParameters(),
     };
   }
@@ -120,8 +121,17 @@ class ConsentPage extends React.Component {
         if (res.status === "ok") {
           // res.data contains the authorization code
           const code = res.data;
-          const concatChar = oAuthParams?.redirectUri?.includes("?") ? "&" : "?";
-          const redirectUrl = `${oAuthParams.redirectUri}${concatChar}code=${code}&state=${oAuthParams.state}`;
+          if (oAuthParams.responseMode === "form_post") {
+            Setting.createFormAndSubmit(oAuthParams.redirectUri, {
+              code: code,
+              state: oAuthParams.state,
+            });
+            return;
+          }
+          const redirectUrl = Util.addSearchParamsToUrl(oAuthParams.redirectUri, {
+            code: code,
+            state: oAuthParams.state,
+          });
           Setting.goToLink(redirectUrl);
         } else {
           Setting.showMessage("error", res.msg);
@@ -132,8 +142,26 @@ class ConsentPage extends React.Component {
 
   handleDeny() {
     const {oAuthParams} = this.state;
-    const concatChar = oAuthParams?.redirectUri?.includes("?") ? "&" : "?";
-    Setting.goToLink(`${oAuthParams.redirectUri}${concatChar}error=access_denied&error_description=User denied consent&state=${oAuthParams.state}`);
+    const application = this.getApplicationObj();
+    const consent = {
+      application: `${application.owner}/${application.name}`,
+      grantedScopes: [],
+    };
+
+    this.setState({denying: true});
+    ConsentBackend.denyConsent(consent, oAuthParams)
+      .then((res) => {
+        if (res.status === "ok") {
+          Setting.goToLink(res.data);
+        } else {
+          Setting.showMessage("error", res.msg);
+          this.setState({denying: false});
+        }
+      })
+      .catch((error) => {
+        Setting.showMessage("error", error.message);
+        this.setState({denying: false});
+      });
   }
 
   render() {
@@ -152,7 +180,7 @@ class ConsentPage extends React.Component {
       );
     }
 
-    const {scopeDescriptions, granting} = this.state;
+    const {scopeDescriptions, granting, denying} = this.state;
     const isScopeEmpty = scopeDescriptions.length === 0;
 
     return (
@@ -227,7 +255,7 @@ class ConsentPage extends React.Component {
                     shape="round"
                     onClick={() => this.handleGrant()}
                     loading={granting}
-                    disabled={granting || isScopeEmpty}
+                    disabled={granting || denying || isScopeEmpty}
                     style={{minWidth: 120, height: 44, fontWeight: 500}}
                   >
                     {i18next.t("permission:Allow")}
@@ -236,7 +264,8 @@ class ConsentPage extends React.Component {
                     size="large"
                     shape="round"
                     onClick={() => this.handleDeny()}
-                    disabled={granting || isScopeEmpty}
+                    loading={denying}
+                    disabled={granting || denying}
                     style={{minWidth: 120, height: 44, fontWeight: 500}}
                   >
                     {i18next.t("permission:Deny")}

@@ -75,6 +75,7 @@ func (c *ApiController) KerberosLogin() {
 	kerberosUsername, err := object.ValidateKerberosToken(organization, spnegoToken)
 	if err != nil {
 		c.Ctx.Output.Header("WWW-Authenticate", "Negotiate")
+		c.Ctx.Output.SetStatus(401)
 		c.ResponseError(fmt.Sprintf("Kerberos authentication failed: %s", err.Error()))
 		return
 	}
@@ -95,6 +96,18 @@ func (c *ApiController) KerberosLogin() {
 		Type:         "code",
 		Application:  applicationName,
 		Organization: organization.Name,
+	}
+	authenticationContext, contextErr := c.beginAuthentication(user, []string{"kerberos"}, "", authForm.Type, application, authForm.UserCode)
+	if contextErr != nil {
+		c.ResponseError(contextErr.Error())
+		return
+	}
+	if checkMfaEnable(c, user, organization, "kerberos") {
+		return
+	}
+	if contextErr = c.completeAuthentication(authenticationContext); contextErr != nil {
+		c.ResponseError(contextErr.Error())
+		return
 	}
 
 	resp := c.HandleLoggedIn(application, user, authForm)

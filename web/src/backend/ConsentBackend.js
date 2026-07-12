@@ -14,21 +14,37 @@
 
 import * as Setting from "../Setting";
 
-export function grantConsent(consent, oAuthParams) {
-  const request = {
+function getConsentOAuthRequest(consent, oAuthParams) {
+  return {
     ...consent,
     clientId: oAuthParams.clientId,
-    provider: "",
-    signinMethod: "",
     responseType: oAuthParams.responseType || "code",
+    responseMode: oAuthParams.responseMode || "",
     redirectUri: oAuthParams.redirectUri,
     scope: oAuthParams.scope,
     state: oAuthParams.state,
     nonce: oAuthParams.nonce || "",
     challenge: oAuthParams.codeChallenge || "",
-    resource: "",
+    resource: oAuthParams.resource || "",
   };
+}
+
+export function grantConsent(consent, oAuthParams) {
+  const request = getConsentOAuthRequest(consent, oAuthParams);
   return fetch(`${Setting.ServerUrl}/api/grant-consent`, {
+    method: "POST",
+    credentials: "include",
+    body: JSON.stringify(request),
+    headers: {
+      "Content-Type": "application/json",
+      "Accept-Language": Setting.getAcceptLanguage(),
+    },
+  }).then(res => res.json());
+}
+
+export function denyConsent(consent, oAuthParams) {
+  const request = getConsentOAuthRequest(consent, oAuthParams);
+  return fetch(`${Setting.ServerUrl}/api/deny-consent`, {
     method: "POST",
     credentials: "include",
     body: JSON.stringify(request),

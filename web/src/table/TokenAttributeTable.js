@@ -24,8 +24,8 @@ class TokenAttributeTable extends React.Component {
     this.state = {
       classes: props,
     };
-    // List of available user fields for "Existing Field" category
-    this.userFields = ["Owner", "Name", "Id", "DisplayName", "Email", "Phone", "Tag", "Roles", "Permissions", "permissionNames", "Groups"];
+    // Reuse the same allowlist as the token-field editor and backend boundary.
+    this.userFields = Setting.getJwtTokenFields();
   }
 
   updateTable(table) {
@@ -70,10 +70,13 @@ class TokenAttributeTable extends React.Component {
         key: "name",
         width: "200px",
         render: (text, record, index) => {
+          const invalidName = String(text ?? "").trim() === "" || Setting.isReservedJwtClaimName(text);
           return (
-            <Input value={text} onChange={e => {
-              this.updateField(table, index, "name", e.target.value);
-            }} />
+            <Tooltip title={Setting.isReservedJwtClaimName(text) ? "Reserved JWT claims cannot be overridden" : ""}>
+              <Input status={invalidName ? "error" : undefined} value={text} onChange={e => {
+                this.updateField(table, index, "name", e.target.value);
+              }} />
+            </Tooltip>
           );
         },
       },
@@ -110,6 +113,7 @@ class TokenAttributeTable extends React.Component {
             // Show dropdown for existing fields
             return (
               <Select virtual={false} style={{width: "100%"}}
+                status={Setting.isSafeJwtTokenField(text, false) ? undefined : "error"}
                 value={text}
                 options={this.userFields.map((field) =>
                   Setting.getOption(field, field))
@@ -141,6 +145,7 @@ class TokenAttributeTable extends React.Component {
               options={[
                 {value: "Array", label: i18next.t("application:Array")},
                 {value: "String", label: i18next.t("application:String")},
+                ...(record.category === "Existing Field" ? [{value: "Boolean", label: "Boolean"}] : []),
               ].map((item) =>
                 Setting.getOption(item.label, item.value))
               }

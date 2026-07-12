@@ -15,50 +15,76 @@
 package object
 
 import (
-	"fmt"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"testing"
-
-	"github.com/casdoor/casdoor/util"
 )
 
 func TestGenerateRsaKeys(t *testing.T) {
-	fileId := "token_jwt_key"
-	certificate, privateKey, err := generateRsaKeys(4096, 512, 20, "Casdoor Cert", "Casdoor Organization")
+	certificate, privateKey, err := generateRsaKeys(2048, 512, 20, "Casdoor Cert", "Casdoor Organization")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
-
-	// Write certificate (aka certificate) to file.
-	util.WriteStringToPath(certificate, fmt.Sprintf("%s.pem", fileId))
-
-	// Write private key to file.
-	util.WriteStringToPath(privateKey, fmt.Sprintf("%s.key", fileId))
+	assertGeneratedKeyPair(t, certificate, privateKey)
 }
 
 func TestGenerateEsKeys(t *testing.T) {
-	fileId := "token_jwt_key"
 	certificate, privateKey, err := generateEsKeys(256, 20, "Casdoor Cert", "Casdoor Organization")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
-
-	// Write certificate (aka certificate) to file.
-	util.WriteStringToPath(certificate, fmt.Sprintf("%s.pem", fileId))
-
-	// Write private key to file.
-	util.WriteStringToPath(privateKey, fmt.Sprintf("%s.key", fileId))
+	assertGeneratedKeyPair(t, certificate, privateKey)
 }
 
 func TestGenerateRsaPssKeys(t *testing.T) {
-	fileId := "token_jwt_key"
-	certificate, privateKey, err := generateRsaPssKeys(4096, 256, 20, "Casdoor Cert", "Casdoor Organization")
+	certificate, privateKey, err := generateRsaPssKeys(2048, 256, 20, "Casdoor Cert", "Casdoor Organization")
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
+	}
+	assertGeneratedKeyPair(t, certificate, privateKey)
+}
+
+func TestGeneratedSigningKeysAreUnique(t *testing.T) {
+	certificate1, privateKey1, err := generateRsaKeys(2048, 256, 20, "cert-built-in", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate2, privateKey2, err := generateRsaKeys(2048, 256, 20, "cert-built-in", "admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if certificate1 == certificate2 || privateKey1 == privateKey2 {
+		t.Fatal("fresh installations received identical signing material")
 	}
 
-	// Write certificate (aka certificate) to file.
-	util.WriteStringToPath(certificate, fmt.Sprintf("%s.pem", fileId))
+	cert1 := parseGeneratedCertificate(t, certificate1)
+	cert2 := parseGeneratedCertificate(t, certificate2)
+	if cert1.SerialNumber.Cmp(cert2.SerialNumber) == 0 {
+		t.Fatal("fresh certificates received the same random serial number")
+	}
+}
 
-	// Write private key to file.
-	util.WriteStringToPath(privateKey, fmt.Sprintf("%s.key", fileId))
+func assertGeneratedKeyPair(t *testing.T, certificate string, privateKey string) {
+	t.Helper()
+	if _, err := tls.X509KeyPair([]byte(certificate), []byte(privateKey)); err != nil {
+		t.Fatalf("generated certificate/key pair is invalid: %v", err)
+	}
+	cert := parseGeneratedCertificate(t, certificate)
+	if cert.SerialNumber == nil || cert.SerialNumber.Sign() <= 0 {
+		t.Fatalf("generated certificate serial is invalid: %v", cert.SerialNumber)
+	}
+}
+
+func parseGeneratedCertificate(t *testing.T, certificate string) *x509.Certificate {
+	t.Helper()
+	block, _ := pem.Decode([]byte(certificate))
+	if block == nil || block.Type != "CERTIFICATE" {
+		t.Fatal("generated certificate is not PEM encoded")
+	}
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
 }

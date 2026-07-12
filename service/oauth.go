@@ -68,7 +68,7 @@ func handleAuthCallback(w http.ResponseWriter, r *http.Request) {
 	//	return
 	//}
 
-	token, tokenError, err := object.GetAuthorizationCodeToken(application, application.ClientSecret, code, "", "")
+	token, tokenError, err := object.GetAuthorizationCodeTokenForHost(application, application.ClientSecret, code, "", "", r.Host)
 	if tokenError != nil {
 		responseError(w, "CasWAF error: casdoorClient.GetOAuthToken() error: %s", tokenError.Error)
 		return
