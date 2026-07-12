@@ -172,7 +172,7 @@ class TokenListPage extends BaseListPage {
           title={() => (
             <div>
               {i18next.t("general:Tokens")}&nbsp;&nbsp;&nbsp;&nbsp;
-              <span style={{color: "#8c8c8c"}}>{i18next.t("token:Credentials are never displayed; use OAuth grants to issue tokens.")}</span>
+              <span data-testid="token-credential-notice" style={{color: "#8c8c8c"}}>{i18next.t("token:Credentials are never displayed; use OAuth grants to issue tokens.")}</span>
             </div>
           )}
           loading={this.getTableLoading()}
