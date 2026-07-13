@@ -23,11 +23,6 @@
 //
 // -- This will overwrite an existing command --
 // Cypress.Commands.overwrite('visit', (originalFn, url, options) => { ... })
-const selector = {
-  username: "#input",
-  password: "#normal_login_password",
-  loginButton: ".ant-btn",
-};
 function getAdminPassword() {
   const password = Cypress.env("adminPassword");
   if (typeof password !== "string" || password.length < 32) {
@@ -36,14 +31,33 @@ function getAdminPassword() {
   return password;
 }
 Cypress.Commands.add('login', ()=>{
+  cy.request({
+    log: false,
+    method: "POST",
+    url: "http://localhost:7001/api/login",
+    body: {
+      "application": "app-built-in",
+      "organization": "built-in",
+      "username": "admin",
+      "password": getAdminPassword(),
+      "signinMethod": "Password",
+      "autoSignin": true,
+      "type": "login",
+    },
+  }).its("body.status").should("eq", "ok");
+  cy.request({
+    log: false,
+    method: "GET",
+    url: "http://localhost:7001/api/get-account",
+  }).then(({body}) => {
+    expect(body.status).to.equal("ok");
+    expect(body.data.accessToken).to.be.a("string").and.not.be.empty;
+  });
   cy.visit("http://localhost:7001", {
     onBeforeLoad(win) {
-      // Disable the page tour so its popover never covers elements the tests click
+      // Disable the page tour so its popover never covers elements the tests click.
       win.localStorage.setItem("isTourVisible", "false");
     },
   });
-  cy.get(selector.username).type("admin");
-  cy.get(selector.password).type(getAdminPassword(), {log: false});
-  cy.get(selector.loginButton).click();
   cy.url().should("eq", "http://localhost:7001/");
 })

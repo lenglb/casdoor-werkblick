@@ -177,8 +177,10 @@ Normal first start creates only a random, forbidden built-in administrator;
 production activation therefore requires the validated bootstrap-data path.
 The upstream Cypress workflow does not weaken that runtime default: a
 build-tagged test-only helper seeds its isolated database with a masked,
-per-run random credential before the server starts. That helper is absent from
-ordinary test builds and every production binary.
+per-run random credential and gives only that isolated built-in client the
+`authorization_code` grant and `profile` scope before the server starts. The
+helper first verifies the grant-free runtime default and is absent from ordinary
+test builds and every production binary.
 
 ## Verification and rollback
 

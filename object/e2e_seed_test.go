@@ -62,6 +62,27 @@ func TestSeedWerkblickE2EAdmin(t *testing.T) {
 		t.Fatalf("isolated E2E seed refused a non-empty database: %v", err)
 	}
 	InitDb()
+	application, err := getApplication("admin", "app-built-in")
+	if err != nil || application == nil {
+		t.Fatalf("load isolated E2E built-in application: %v", err)
+	}
+	if len(application.GrantTypes) != 0 || len(application.Scopes) != 0 {
+		t.Fatal("built-in application did not start in the secure grant-free state")
+	}
+	application.GrantTypes = []string{"authorization_code"}
+	application.Scopes = []*ScopeItem{{Name: "profile", DisplayName: "Profile"}}
+	if changed, updateErr := UpdateApplication(
+		application.GetId(), application, true, "", []string{"grant_types", "scopes"},
+	); updateErr != nil || !changed {
+		t.Fatalf("authorize isolated E2E built-in application: changed=%v err=%v", changed, updateErr)
+	}
+	application, err = getApplication("admin", "app-built-in")
+	if err != nil || application == nil ||
+		len(application.GrantTypes) != 1 || application.GrantTypes[0] != "authorization_code" ||
+		len(application.Scopes) != 1 || application.Scopes[0] == nil ||
+		application.Scopes[0].Name != "profile" {
+		t.Fatalf("verify isolated E2E built-in application: %v", err)
+	}
 
 	user, err := getUser("built-in", "admin")
 	if err != nil {
