@@ -64,6 +64,7 @@ import TokenAttributeTable from "./table/TokenAttributeTable";
 import {Content, Header} from "antd/es/layout/layout";
 import Sider from "antd/es/layout/Sider";
 import PaginateSelect from "./common/PaginateSelect";
+import {normalizeApplicationGrantTypes, normalizeApplicationScopes} from "./ApplicationSecurityDefaults.mjs";
 
 const {Option} = Select;
 
@@ -177,9 +178,8 @@ class ApplicationEditPage extends React.Component {
         }
 
         const application = res.data;
-        if (application.grantTypes === null || application.grantTypes === undefined || application.grantTypes.length === 0) {
-          application.grantTypes = ["authorization_code"];
-        }
+        application.grantTypes = normalizeApplicationGrantTypes(application.grantTypes);
+        application.scopes = normalizeApplicationScopes(application.scopes);
 
         if (application.tags === null || application.tags === undefined) {
           application.tags = [];
@@ -801,22 +801,18 @@ class ApplicationEditPage extends React.Component {
               </Select>
             </Col>
           </Row>
-          {
-            (this.state.application.category === "Agent") ? (
-              <Row style={{marginTop: "20px"}} >
-                <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
-                  {Setting.getLabel(i18next.t("general:Scopes"), i18next.t("general:Scopes - Tooltip"))} :
-                </Col>
-                <Col span={21} >
-                  <ScopeTable
-                    title={i18next.t("general:Scopes")}
-                    table={this.state.application.scopes}
-                    onUpdateTable={(value) => {this.updateApplicationField("scopes", value);}}
-                  />
-                </Col>
-              </Row>
-            ) : null
-          }
+          <Row style={{marginTop: "20px"}} >
+            <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
+              {Setting.getLabel(i18next.t("general:Scopes"), i18next.t("general:Scopes - Tooltip"))} :
+            </Col>
+            <Col span={21} >
+              <ScopeTable
+                title={i18next.t("general:Scopes")}
+                table={this.state.application.scopes}
+                onUpdateTable={(value) => {this.updateApplicationField("scopes", value);}}
+              />
+            </Col>
+          </Row>
           <Row style={{marginTop: "20px"}} >
             <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
               {Setting.getLabel(i18next.t("general:Custom scopes"), i18next.t("general:Custom scopes - Tooltip"))} :

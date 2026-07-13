@@ -53,6 +53,12 @@ func TestGrantTypesRequireExplicitAllowlistEntry(t *testing.T) {
 			grantTypes: []string{""},
 			want:       false,
 		},
+		{
+			name:       "configured unknown grant remains invalid",
+			grantType:  "attacker_defined_grant",
+			grantTypes: []string{"attacker_defined_grant"},
+			want:       false,
+		},
 	}
 
 	for _, test := range tests {
@@ -61,6 +67,101 @@ func TestGrantTypesRequireExplicitAllowlistEntry(t *testing.T) {
 				t.Fatalf("IsGrantTypeValid(%q, %v) = %v, want %v", test.grantType, test.grantTypes, got, test.want)
 			}
 		})
+	}
+}
+
+func TestOAuthGrantTypeConfigurationUsesImplementedEnum(t *testing.T) {
+	valid := []string{
+		"authorization_code",
+		"password",
+		"client_credentials",
+		"token",
+		"id_token",
+		"refresh_token",
+		"urn:ietf:params:oauth:grant-type:jwt-bearer",
+		"urn:ietf:params:oauth:grant-type:device_code",
+		"urn:ietf:params:oauth:grant-type:token-exchange",
+	}
+	if err := ValidateOAuthGrantTypes(valid); err != nil {
+		t.Fatalf("implemented grants rejected: %v", err)
+	}
+	for _, grants := range [][]string{
+		{"attacker_defined_grant"},
+		{""},
+		{"authorization_code", "authorization_code"},
+	} {
+		if err := ValidateOAuthGrantTypes(grants); err == nil {
+			t.Fatalf("invalid grants accepted: %v", grants)
+		}
+	}
+}
+
+func TestDynamicClientResponseTypesMustMatchExplicitGrantTypes(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		grantTypes    []string
+		responseTypes []string
+		wantError     bool
+	}{
+		{name: "explicit code", grantTypes: []string{"authorization_code"}, responseTypes: []string{"code"}},
+		{name: "explicit implicit token", grantTypes: []string{"token"}, responseTypes: []string{"token"}},
+		{name: "empty metadata", grantTypes: []string{}, responseTypes: []string{}},
+		{name: "code without grant", grantTypes: []string{}, responseTypes: []string{"code"}, wantError: true},
+		{name: "mismatched m2m", grantTypes: []string{"client_credentials"}, responseTypes: []string{"code"}, wantError: true},
+		{name: "unknown response", grantTypes: []string{"authorization_code"}, responseTypes: []string{"other"}, wantError: true},
+		{name: "unknown grant", grantTypes: []string{"other"}, responseTypes: []string{}, wantError: true},
+		{name: "duplicate response", grantTypes: []string{"authorization_code"}, responseTypes: []string{"code", "code"}, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateDynamicClientOAuthMetadata(test.grantTypes, test.responseTypes)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validation error = %v, wantError=%v", err, test.wantError)
+			}
+		})
+	}
+}
+
+func TestDirectGrantHelpersRejectMissingAllowlistBeforeStateAccess(t *testing.T) {
+	application := &Application{Owner: "admin", Name: "no-grants", ClientId: "no-grants-client"}
+
+	codeToken, tokenError, err := GetAuthorizationCodeToken(application, "", "any-code", "", "")
+	if err != nil || codeToken != nil || tokenError == nil || tokenError.Error != UnsupportedGrantType {
+		t.Fatalf("direct code exchange = (%#v, %#v, %v), want unsupported_grant_type", codeToken, tokenError, err)
+	}
+
+	refreshResult, err := RefreshToken(application, "refresh_token", "any-refresh-token", "", application.ClientId, "", "", "")
+	if err != nil {
+		t.Fatalf("direct refresh returned internal error: %v", err)
+	}
+	refreshError, ok := refreshResult.(*TokenError)
+	if !ok || refreshError.Error != UnsupportedGrantType {
+		t.Fatalf("direct refresh = %#v, want unsupported_grant_type", refreshResult)
+	}
+}
+
+func TestDeviceAuthorizationValidatesGrantAndScopeBeforeStateCreation(t *testing.T) {
+	application := &Application{Scopes: []*ScopeItem{{Name: "openid"}}}
+	if scope, tokenError := ValidateDeviceAuthorizationRequest(application, "openid"); scope != "" || tokenError == nil || tokenError.Error != UnauthorizedClient {
+		t.Fatalf("device auth without grant = (%q, %#v)", scope, tokenError)
+	}
+	application.GrantTypes = []string{"urn:ietf:params:oauth:grant-type:device_code"}
+	if scope, tokenError := ValidateDeviceAuthorizationRequest(application, "admin"); scope != "" || tokenError == nil || tokenError.Error != InvalidScope {
+		t.Fatalf("device auth with invalid scope = (%q, %#v)", scope, tokenError)
+	}
+	if scope, tokenError := ValidateDeviceAuthorizationRequest(application, "openid"); scope != "openid" || tokenError != nil {
+		t.Fatalf("valid device auth = (%q, %#v)", scope, tokenError)
+	}
+}
+
+func TestIdTokenGrantRequiresNonce(t *testing.T) {
+	if tokenError := ValidateOAuthNonceForGrant("id_token", ""); tokenError == nil || tokenError.Error != InvalidRequest {
+		t.Fatalf("missing id_token nonce error = %#v", tokenError)
+	}
+	if tokenError := ValidateOAuthNonceForGrant("id_token", "nonce-value"); tokenError != nil {
+		t.Fatalf("valid id_token nonce rejected: %#v", tokenError)
+	}
+	if tokenError := ValidateOAuthNonceForGrant("token", ""); tokenError != nil {
+		t.Fatalf("access-token grant unexpectedly required OIDC nonce: %#v", tokenError)
 	}
 }
 

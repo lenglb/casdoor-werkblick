@@ -54,6 +54,7 @@ func TestAuthorizationCodeCanOnlyBeConsumedOnce(t *testing.T) {
 		Name:         "security-test-app",
 		ClientId:     "security-test-client",
 		ClientSecret: "security-test-secret",
+		GrantTypes:   []string{"authorization_code"},
 	}
 	token := &Token{
 		Owner:        application.Owner,
@@ -132,6 +133,7 @@ func TestInvalidAuthorizationCodeRequestDoesNotConsumeCode(t *testing.T) {
 		Name:                    "security-test-app",
 		ClientId:                "security-test-client",
 		TokenEndpointAuthMethod: "none",
+		GrantTypes:              []string{"authorization_code"},
 	}
 	verifier := "correct-verifier"
 	token := &Token{
@@ -180,6 +182,7 @@ func TestConfidentialClientPKCEDoesNotBypassClientSecret(t *testing.T) {
 		Name:         "confidential-app",
 		ClientId:     "confidential-client",
 		ClientSecret: "required-secret",
+		GrantTypes:   []string{"authorization_code"},
 	}
 	verifier := "correct-verifier"
 	token := &Token{
@@ -215,8 +218,8 @@ func TestConfidentialClientPKCEDoesNotBypassClientSecret(t *testing.T) {
 func TestAuthorizationCodeIsBoundToApplicationOwner(t *testing.T) {
 	setupTokenSecurityTestOrmer(t)
 
-	issuedApplication := &Application{Owner: "admin", Name: "same-name", ClientSecret: "secret"}
-	requestingApplication := &Application{Owner: "other-owner", Name: issuedApplication.Name, ClientSecret: issuedApplication.ClientSecret}
+	issuedApplication := &Application{Owner: "admin", Name: "same-name", ClientSecret: "secret", GrantTypes: []string{"authorization_code"}}
+	requestingApplication := &Application{Owner: "other-owner", Name: issuedApplication.Name, ClientSecret: issuedApplication.ClientSecret, GrantTypes: []string{"authorization_code"}}
 	token := &Token{
 		Owner:        issuedApplication.Owner,
 		Name:         "owner-bound-code-token",

@@ -45,8 +45,8 @@ func TestSchemaMigrationOnlyStopsAfterCreateTables(t *testing.T) {
 	}
 }
 
-func TestSchemaMigrationOnlyRequiresExactTrueLiteral(t *testing.T) {
-	for _, value := range []string{"", "false", "TRUE", "1", " true ", "true\n"} {
+func TestSpecialStartupFlagsAcceptOnlyExplicitBooleanValues(t *testing.T) {
+	for _, value := range []string{"", "false"} {
 		t.Run(value, func(t *testing.T) {
 			normalBootCalls := 0
 			hooks := startupHooks{
@@ -73,6 +73,45 @@ func TestSchemaMigrationOnlyRequiresExactTrueLiteral(t *testing.T) {
 	}
 }
 
+func TestInvalidSpecialStartupFlagsFailBeforeInitialization(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		migration string
+		bootstrap string
+	}{
+		{name: "uppercase migration", migration: "TRUE"},
+		{name: "numeric migration", migration: "1"},
+		{name: "whitespace migration", migration: " true "},
+		{name: "newline migration", migration: "true\n"},
+		{name: "uppercase bootstrap", bootstrap: "FALSE"},
+		{name: "numeric bootstrap", bootstrap: "0"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := []string{}
+			hooks := startupHooks{
+				initAPI:         func() { events = append(events, "init-api") },
+				initFlag:        func() { events = append(events, "init-flag") },
+				initAdapter:     func() { events = append(events, "init-adapter") },
+				createTables:    func() { events = append(events, "create-tables") },
+				initDb:          func() { events = append(events, "init-db") },
+				initFromFile:    func() { events = append(events, "init-from-file") },
+				startNormalBoot: func() { events = append(events, "normal-boot") },
+			}
+
+			mode, err := runStartup(test.migration, test.bootstrap, hooks)
+			if err == nil {
+				t.Fatal("invalid startup flag was accepted")
+			}
+			if mode != "" {
+				t.Fatalf("startup mode = %q, want empty", mode)
+			}
+			if len(events) != 0 {
+				t.Fatalf("startup hooks ran before flag validation: %v", events)
+			}
+		})
+	}
+}
+
 func TestBootstrapDataOnlyHasIsolatedCallOrder(t *testing.T) {
 	events := []string{}
 	hooks := startupHooks{
@@ -93,7 +132,7 @@ func TestBootstrapDataOnlyHasIsolatedCallOrder(t *testing.T) {
 		t.Fatalf("startup mode = %q, want bootstrap-data-only", mode)
 	}
 
-	want := []string{"init-api", "init-flag", "init-adapter", "create-tables", "init-db", "init-from-file"}
+	want := []string{"init-api", "init-flag", "init-adapter", "create-tables", "init-from-file", "init-db"}
 	if !reflect.DeepEqual(events, want) {
 		t.Fatalf("startup events = %v, want %v", events, want)
 	}

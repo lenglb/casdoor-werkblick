@@ -165,10 +165,52 @@ func pkceChallenge(verifier string) string {
 	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(sum[:])
 }
 
-// IsGrantTypeValid checks if grantType is explicitly allowed in the current
-// application. An empty allowlist rejects every grant type.
+var supportedOAuthGrantTypes = map[string]struct{}{
+	"authorization_code": {},
+	"password":           {},
+	"client_credentials": {},
+	"token":              {},
+	"id_token":           {},
+	"refresh_token":      {},
+	"urn:ietf:params:oauth:grant-type:jwt-bearer":     {},
+	"urn:ietf:params:oauth:grant-type:device_code":    {},
+	"urn:ietf:params:oauth:grant-type:token-exchange": {},
+}
+
+func IsSupportedOAuthGrantType(grantType string) bool {
+	_, ok := supportedOAuthGrantTypes[grantType]
+	return ok
+}
+
+func ValidateOAuthGrantTypes(grantTypes []string) error {
+	seen := make(map[string]struct{}, len(grantTypes))
+	for _, grantType := range grantTypes {
+		if !IsSupportedOAuthGrantType(grantType) {
+			return fmt.Errorf("unsupported OAuth grant type: %q", grantType)
+		}
+		if _, ok := seen[grantType]; ok {
+			return fmt.Errorf("OAuth grant type is duplicated: %q", grantType)
+		}
+		seen[grantType] = struct{}{}
+	}
+	return nil
+}
+
+func ValidateOAuthNonceForGrant(grantType string, nonce string) *TokenError {
+	if grantType == "id_token" && strings.TrimSpace(nonce) == "" {
+		return &TokenError{
+			Error:            InvalidRequest,
+			ErrorDescription: "nonce is required for id_token issuance",
+		}
+	}
+	return nil
+}
+
+// IsGrantTypeValid checks if grantType is both implemented by the server and
+// explicitly allowed in the current application. An empty allowlist rejects
+// every grant type.
 func IsGrantTypeValid(method string, grantTypes []string) bool {
-	if method == "" {
+	if !IsSupportedOAuthGrantType(method) {
 		return false
 	}
 	for _, m := range grantTypes {
@@ -262,6 +304,23 @@ func IsScopeValid(scope string, application *Application) bool {
 	return ok
 }
 
+func ValidateDeviceAuthorizationRequest(application *Application, scope string) (string, *TokenError) {
+	if application == nil || !IsGrantTypeValid("urn:ietf:params:oauth:grant-type:device_code", application.GrantTypes) {
+		return "", &TokenError{
+			Error:            UnauthorizedClient,
+			ErrorDescription: "device_code grant is not enabled for this application",
+		}
+	}
+	expandedScope, ok := IsScopeValidAndExpand(scope, application)
+	if !ok {
+		return "", &TokenError{
+			Error:            InvalidScope,
+			ErrorDescription: "the requested scope is invalid or not defined in the application",
+		}
+	}
+	return expandedScope, nil
+}
+
 func ExpireTokenByAccessToken(accessToken string) (bool, *Application, *Token, error) {
 	token, err := GetTokenByAccessToken(accessToken)
 	if err != nil {
@@ -286,7 +345,8 @@ func ExpireTokenByAccessToken(accessToken string) (bool, *Application, *Token, e
 }
 
 func CheckOAuthLogin(clientId string, responseType string, redirectUri string, scope string, state string, lang string) (string, *Application, error) {
-	if responseType != "code" && responseType != "token" && responseType != "id_token" {
+	requiredGrant, supportedResponseType := requiredGrantForOAuthResponseType(responseType)
+	if !supportedResponseType {
 		return fmt.Sprintf(i18n.Translate(lang, "token:Grant_type: %s is not supported in this application"), responseType), nil, nil
 	}
 
@@ -297,6 +357,9 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 
 	if application == nil {
 		return i18n.Translate(lang, "token:Invalid client_id"), nil, nil
+	}
+	if !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return fmt.Sprintf(i18n.Translate(lang, "token:Grant_type: %s is not supported in this application"), requiredGrant), application, nil
 	}
 
 	if !application.IsRedirectUriValid(redirectUri) {
@@ -312,6 +375,17 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 	return "", application, nil
 }
 
+func requiredGrantForOAuthResponseType(responseType string) (string, bool) {
+	switch responseType {
+	case "code":
+		return "authorization_code", true
+	case "token", "id_token":
+		return responseType, true
+	default:
+		return "", false
+	}
+}
+
 // GetOAuthCode is retained for source compatibility with integrations compiled
 // against the legacy API. Provider and sign-in labels are not trusted
 // authentication evidence, so legacy issuance fails closed. Callers must move
@@ -322,6 +396,17 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 }
 
 func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authenticationContext AuthenticationContext, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, host string, lang string) (*Code, error) {
+	msg, application, err := CheckOAuthLogin(clientId, responseType, redirectUri, scope, state, lang)
+	if err != nil {
+		return nil, err
+	}
+	if msg != "" {
+		return &Code{
+			Message: msg,
+			Code:    "",
+		}, nil
+	}
+
 	user, err := GetUser(userId)
 	if err != nil {
 		return nil, err
@@ -346,18 +431,6 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 	}
 	if authenticationContext.Subject != user.GetId() {
 		return nil, fmt.Errorf("authentication context subject %q does not match user %q", authenticationContext.Subject, user.GetId())
-	}
-
-	msg, application, err := CheckOAuthLogin(clientId, responseType, redirectUri, scope, state, lang)
-	if err != nil {
-		return nil, err
-	}
-
-	if msg != "" {
-		return &Code{
-			Message: msg,
-			Code:    "",
-		}, nil
 	}
 
 	// Expand regex/wildcard scopes to concrete scope names.
@@ -445,6 +518,12 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 				ErrorDescription: "client_id is invalid",
 			}, nil
 		}
+	}
+	if !IsGrantTypeValid("refresh_token", application.GrantTypes) {
+		return &TokenError{
+			Error:            UnsupportedGrantType,
+			ErrorDescription: "refresh_token is not enabled for this application",
+		}, nil
 	}
 
 	// check whether the refresh token is valid, and has not expired.

@@ -247,6 +247,10 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 		} else {
 			scope := c.Ctx.Input.Query("scope")
 			nonce := c.Ctx.Input.Query("nonce")
+			if nonceError := object.ValidateOAuthNonceForGrant(form.Type, nonce); nonceError != nil {
+				resp = &Response{Status: "error", Msg: nonceError.ErrorDescription, Data: ""}
+				return
+			}
 			expandedScope, valid := object.IsScopeValidAndExpand(scope, application)
 			if !valid {
 				resp = &Response{Status: "error", Msg: "error: invalid_scope", Data: ""}
@@ -256,7 +260,7 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 					resp = &Response{Status: "error", Msg: "error: verified authentication context is required", Data: ""}
 					return
 				}
-				token, tokenErr := object.GetTokenByUserWithAuthenticationContext(application, user, expandedScope, nonce, c.Ctx.Request.Host, authenticationContext)
+				token, tokenErr := object.GetTokenByUserForGrantWithAuthenticationContext(application, user, form.Type, expandedScope, nonce, c.Ctx.Request.Host, authenticationContext)
 				if tokenErr != nil {
 					resp = &Response{Status: "error", Msg: tokenErr.Error(), Data: ""}
 					return
@@ -1848,6 +1852,13 @@ func (c *ApiController) DeviceAuth() {
 		c.ServeJSON()
 		return
 	}
+	expandedScope, deviceAuthError := object.ValidateDeviceAuthorizationRequest(application, scope)
+	if deviceAuthError != nil {
+		c.Data["json"] = deviceAuthError
+		c.ServeJSON()
+		return
+	}
+	scope = expandedScope
 
 	deviceCode := util.GenerateId()
 	userCode := util.GetRandomName()

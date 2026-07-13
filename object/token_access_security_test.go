@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupTokenAccessTestOrmer(t *testing.T) {
@@ -41,6 +42,29 @@ func setupTokenAccessTestOrmer(t *testing.T) {
 		ormer = previousOrmer
 		testOrmer.close()
 	})
+}
+
+func TestSessionBoundUserTokenMintRequiresGrantScopeAndActiveUser(t *testing.T) {
+	context := AuthenticationContext{Subject: "tenant/alice", AuthTime: time.Now().Unix(), Amr: []string{"pwd"}}
+	user := &User{Owner: "tenant", Name: "alice", Id: "user-1"}
+	application := &Application{Owner: "admin", Name: "app", Organization: "tenant"}
+
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Fatalf("missing grant error = %v", err)
+	}
+	application.GrantTypes = []string{"authorization_code"}
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "scope") {
+		t.Fatalf("missing scope error = %v", err)
+	}
+
+	setupTokenAccessTestOrmer(t)
+	user.IsForbidden = true
+	organization := &Organization{Owner: "admin", Name: "tenant"}
+	insertTokenAccessFixtures(t, user, organization)
+	application.Scopes = []*ScopeItem{{Name: "profile"}}
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("forbidden user mint error = %v", err)
+	}
 }
 
 func insertTokenAccessFixtures(t *testing.T, user *User, organization *Organization) {

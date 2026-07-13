@@ -291,10 +291,6 @@ func (c *ApiController) AddApplication() {
 		return
 	}
 
-	if len(application.GrantTypes) == 0 {
-		application.GrantTypes = []string{"authorization_code"}
-	}
-
 	if application.Tags == nil {
 		application.Tags = []string{}
 	}

@@ -89,8 +89,8 @@ jobs:
       - name: Install locked dependencies
         run: yarn install --frozen-lockfile --network-timeout 1000000
 
-      - name: Run provider-state unit tests
-        run: node --test src/auth/ProviderState.test.mjs
+      - name: Run frontend security unit tests
+        run: node --test src/auth/ProviderState.test.mjs src/ApplicationSecurityDefaults.test.mjs
 
       - name: Build production frontend
         env:

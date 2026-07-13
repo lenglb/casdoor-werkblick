@@ -418,6 +418,9 @@ func GetApplication(id string) (*Application, error) {
 }
 
 func UpdateApplication(id string, application *Application, isGlobalAdmin bool, lang string, columns []string) (bool, error) {
+	if err := ValidateOAuthGrantTypes(application.GrantTypes); err != nil {
+		return false, err
+	}
 	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		return false, err
@@ -495,6 +498,9 @@ func UpdateApplication(id string, application *Application, isGlobalAdmin bool, 
 }
 
 func AddApplication(application *Application) (bool, error) {
+	if err := ValidateOAuthGrantTypes(application.GrantTypes); err != nil {
+		return false, err
+	}
 	if application.Owner == "" {
 		application.Owner = "admin"
 	}

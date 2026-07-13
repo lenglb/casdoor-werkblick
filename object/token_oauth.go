@@ -72,6 +72,9 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 			ErrorDescription: fmt.Sprintf("grant_type: %s is not supported in this application", grantType),
 		}, nil
 	}
+	if nonceError := ValidateOAuthNonceForGrant(grantType, nonce); nonceError != nil {
+		return nonceError, nil
+	}
 	if application.IsPublicClient() {
 		switch grantType {
 		case "client_credentials", "password", "urn:ietf:params:oauth:grant-type:jwt-bearer", "urn:ietf:params:oauth:grant-type:token-exchange":
@@ -140,6 +143,11 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 			return nil, err
 		}
 		return refreshToken2, nil
+	default:
+		return &TokenError{
+			Error:            UnsupportedGrantType,
+			ErrorDescription: fmt.Sprintf("grant_type: %s is not implemented by this server", grantType),
+		}, nil
 	}
 
 	if err != nil {
@@ -150,6 +158,13 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 	if tokenError != nil {
 		abortDeviceAuthTokenIssuance(deviceCode, claimedDeviceAuth, token)
 		return tokenError, nil
+	}
+	if token == nil {
+		abortDeviceAuthTokenIssuance(deviceCode, claimedDeviceAuth, token)
+		return &TokenError{
+			Error:            EndpointError,
+			ErrorDescription: "OAuth grant completed without issuing a token",
+		}, nil
 	}
 
 	// Authorization-code DPoP binding is persisted atomically with code
@@ -292,6 +307,12 @@ func GetAuthorizationCodeTokenForHost(application *Application, clientSecret str
 }
 
 func getAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, resource string, host string, dpopJkt string) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid("authorization_code", application.GrantTypes) {
+		return nil, &TokenError{
+			Error:            UnsupportedGrantType,
+			ErrorDescription: "authorization_code is not enabled for this application",
+		}, nil
+	}
 	if code == "" {
 		return nil, &TokenError{
 			Error:            InvalidRequest,
@@ -704,8 +725,39 @@ func GetTokenByUserWithAuthenticationContext(application *Application, user *Use
 	return getTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, &authenticationContext)
 }
 
+func GetTokenByUserForGrantWithAuthenticationContext(application *Application, user *User, requiredGrant string, scope string, nonce string, host string, authenticationContext AuthenticationContext) (*Token, error) {
+	if application == nil || !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return nil, fmt.Errorf("OAuth grant type %q is not enabled for this application", requiredGrant)
+	}
+	return getTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, &authenticationContext)
+}
+
 func getTokenByUserWithAuthenticationContext(application *Application, user *User, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, error) {
-	err := ExtendUserWithRolesAndPermissions(user)
+	if application == nil || authenticationContext == nil {
+		return nil, fmt.Errorf("application and trusted authentication context are required")
+	}
+	preservedContext, err := PreserveAuthenticationContext(*authenticationContext)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil || preservedContext.Subject != user.GetId() {
+		return nil, fmt.Errorf("authentication context subject does not match user")
+	}
+	expandedScope, ok := IsScopeValidAndExpand(scope, application)
+	if !ok {
+		return nil, fmt.Errorf("requested scope is invalid or not defined in the application")
+	}
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil {
+		return nil, err
+	}
+	if tokenError != nil {
+		return nil, fmt.Errorf("%s: %s", tokenError.Error, tokenError.ErrorDescription)
+	}
+	scope = expandedScope
+	authenticationContext = &preservedContext
+
+	err = ExtendUserWithRolesAndPermissions(user)
 	if err != nil {
 		return nil, err
 	}
@@ -1045,7 +1097,7 @@ func GetAccessTokenByUser(user *User, host string, authenticationContexts ...Aut
 		return "", fmt.Errorf("the application for user %s is not found", user.Id)
 	}
 
-	token, err := GetTokenByUserWithAuthenticationContext(application, user, "profile", "", host, authenticationContext)
+	token, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", host, authenticationContext)
 	if err != nil {
 		return "", err
 	}

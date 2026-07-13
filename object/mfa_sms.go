@@ -48,6 +48,19 @@ func (mfa *SmsMfa) SetupVerify(passCode string) error {
 }
 
 func (mfa *SmsMfa) Enable(user *User) error {
+	if mfa.MfaType == EmailType {
+		updatedUser, err := EnableUserEmailMfaFromVerifiedChallenge(user.GetId(), mfa.Secret, mfa.RecoveryCodes)
+		if err != nil {
+			return err
+		}
+		user.Email = updatedUser.Email
+		user.EmailVerified = updatedUser.EmailVerified
+		user.MfaEmailEnabled = updatedUser.MfaEmailEnabled
+		user.RecoveryCodes = updatedUser.RecoveryCodes
+		user.PreferredMfaType = updatedUser.PreferredMfaType
+		return nil
+	}
+
 	columns := []string{"recovery_codes", "preferred_mfa_type"}
 
 	user.RecoveryCodes = append(user.RecoveryCodes, mfa.RecoveryCodes...)
@@ -58,10 +71,6 @@ func (mfa *SmsMfa) Enable(user *User) error {
 	if mfa.MfaType == SmsType {
 		user.MfaPhoneEnabled = true
 		columns = append(columns, "mfa_phone_enabled", "phone", "country_code")
-	} else if mfa.MfaType == EmailType {
-		user.MfaEmailEnabled = true
-		user.EmailVerified = true
-		columns = append(columns, "mfa_email_enabled", "email", "email_verified")
 	}
 
 	_, err := UpdateUser(user.GetId(), user, columns, false)

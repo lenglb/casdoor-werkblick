@@ -304,12 +304,19 @@ func TestDynamicPrivateKeyJwtClientNeverGetsSharedSecret(t *testing.T) {
 		ClientName:              "private key client",
 		RedirectUris:            []string{"https://client.example.test/callback"},
 		TokenEndpointAuthMethod: ClientAuthMethodPrivateKeyJwt,
+		Scope:                   "openid profile openid",
 	}, "security-org", "https://id.example.test/api/register")
 	if err != nil || dcrError != nil {
 		t.Fatalf("RegisterDynamicClient() = (%#v, %#v, %v)", response, dcrError, err)
 	}
 	if response.ClientSecret != "" {
 		t.Fatalf("DCR response exposed private_key_jwt client secret %q", response.ClientSecret)
+	}
+	if len(response.GrantTypes) != 0 || len(response.ResponseTypes) != 0 {
+		t.Fatalf("DCR added implicit browser grants: grants=%v responseTypes=%v", response.GrantTypes, response.ResponseTypes)
+	}
+	if response.Scope != "openid profile" {
+		t.Fatalf("normalized DCR scope = %q, want %q", response.Scope, "openid profile")
 	}
 
 	stored := &Application{}
@@ -320,11 +327,22 @@ func TestDynamicPrivateKeyJwtClientNeverGetsSharedSecret(t *testing.T) {
 	if stored.ClientSecret != "" {
 		t.Fatalf("stored private_key_jwt client secret = %q, want empty", stored.ClientSecret)
 	}
+	if len(stored.GrantTypes) != 0 {
+		t.Fatalf("stored DCR grants = %v, want empty", stored.GrantTypes)
+	}
+	if len(stored.Scopes) != 2 || stored.Scopes[0].Name != "openid" || stored.Scopes[1].Name != "profile" {
+		t.Fatalf("stored DCR scopes = %#v, want deduplicated literal allowlist", stored.Scopes)
+	}
+	readResponse := GetDynamicClientRegistrationResponse(stored, "https://id.example.test/api/register")
+	if readResponse.Scope != "openid profile" {
+		t.Fatalf("DCR read response scope = %q, want stored contract", readResponse.Scope)
+	}
 
 	secretResponse, dcrError, err := RegisterDynamicClient(&DynamicClientRegistrationRequest{
 		ClientName:              "rotated private key client",
 		RedirectUris:            []string{"https://rotated.example.test/callback"},
 		TokenEndpointAuthMethod: ClientAuthMethodSecretBasic,
+		GrantTypes:              []string{"client_credentials"},
 	}, "security-org", "https://id.example.test/api/register")
 	if err != nil || dcrError != nil || secretResponse.ClientSecret == "" {
 		t.Fatalf("register initial secret client = (%#v, %#v, %v)", secretResponse, dcrError, err)
@@ -336,6 +354,7 @@ func TestDynamicPrivateKeyJwtClientNeverGetsSharedSecret(t *testing.T) {
 	updatedResponse, dcrError, err := UpdateDynamicClient(secretApplication, &DynamicClientRegistrationRequest{
 		RedirectUris:            secretApplication.RedirectUris,
 		TokenEndpointAuthMethod: ClientAuthMethodPrivateKeyJwt,
+		GrantTypes:              []string{},
 	})
 	if err != nil || dcrError != nil {
 		t.Fatalf("update to private_key_jwt = (%#v, %#v, %v)", updatedResponse, dcrError, err)
@@ -343,9 +362,15 @@ func TestDynamicPrivateKeyJwtClientNeverGetsSharedSecret(t *testing.T) {
 	if updatedResponse.ClientSecret != "" {
 		t.Fatalf("updated DCR response retained client secret %q", updatedResponse.ClientSecret)
 	}
+	if len(updatedResponse.GrantTypes) != 0 {
+		t.Fatalf("explicit empty DCR grant update = %v, want empty", updatedResponse.GrantTypes)
+	}
 	stored = &Application{}
 	exists, err = testOrmer.Engine.Where("client_id = ?", secretResponse.ClientId).Get(stored)
 	if err != nil || !exists || stored.ClientSecret != "" {
 		t.Fatalf("stored updated private_key_jwt client = (%#v, %v, %v), want empty secret", stored, exists, err)
+	}
+	if len(stored.GrantTypes) != 0 {
+		t.Fatalf("stored explicit empty DCR grants = %v", stored.GrantTypes)
 	}
 }

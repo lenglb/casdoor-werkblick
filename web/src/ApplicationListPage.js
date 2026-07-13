@@ -23,6 +23,7 @@ import i18next from "i18next";
 import BaseListPage from "./BaseListPage";
 import PopconfirmModal from "./common/modal/PopconfirmModal";
 import {SignupTableDefaultCssMap} from "./table/SignupTable";
+import {newApplicationGrantTypes} from "./ApplicationSecurityDefaults.mjs";
 
 class ApplicationListPage extends BaseListPage {
   constructor(props) {
@@ -70,7 +71,7 @@ class ApplicationListPage extends BaseListPage {
         {name: "Signup button", visible: true, required: true, rule: "None"},
         {name: "Providers", visible: true, required: true, rule: "None", customCss: SignupTableDefaultCssMap["Providers"]},
       ],
-      grantTypes: ["authorization_code", "password", "client_credentials", "token", "id_token", "refresh_token"],
+      grantTypes: newApplicationGrantTypes(),
       cert: "cert-built-in",
       redirectUris: ["http://localhost:9000/callback"],
       tokenFormat: "JWT",

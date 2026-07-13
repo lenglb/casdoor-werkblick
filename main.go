@@ -56,12 +56,29 @@ type startupHooks struct {
 	startNormalBoot func()
 }
 
-// runStartup deliberately accepts only the exact literal "true" for special
-// startup modes. Misspelled or unexpectedly formatted values stay on the
-// normal startup path instead of silently exiting a production service.
+func parseStartupBoolean(name string, value string) (bool, error) {
+	switch value {
+	case "", "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be empty, false, or true; got %q", name, value)
+	}
+}
+
+// runStartup validates both one-shot controls before any initialization hook.
+// Typos fail closed instead of starting a listener before the intended
+// migration or bootstrap quarantine has run.
 func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks startupHooks) (startupMode, error) {
-	migrationOnly := migrationOnlyValue == "true"
-	bootstrapOnly := bootstrapOnlyValue == "true"
+	migrationOnly, err := parseStartupBoolean(schemaMigrationOnlyEnv, migrationOnlyValue)
+	if err != nil {
+		return "", err
+	}
+	bootstrapOnly, err := parseStartupBoolean(bootstrapDataOnlyEnv, bootstrapOnlyValue)
+	if err != nil {
+		return "", err
+	}
 	if migrationOnly && bootstrapOnly {
 		return "", fmt.Errorf("%s and %s are mutually exclusive", schemaMigrationOnlyEnv, bootstrapDataOnlyEnv)
 	}
@@ -75,8 +92,8 @@ func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks star
 		return startupModeSchemaOnly, nil
 	}
 	if bootstrapOnly {
-		hooks.initDb()
 		hooks.initFromFile()
+		hooks.initDb()
 		return startupModeBootstrapOnly, nil
 	}
 

@@ -829,7 +829,6 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 			}
 		}
 	}
-
 	if name != user.Name {
 		err := userChangeTrigger(owner, name, user.Name)
 		if err != nil {
@@ -912,6 +911,97 @@ func applyEmailVerificationInvariant(oldUser, user *User, columns []string) []st
 	return columns
 }
 
+// UpdateUserEmailFromVerifiedChallenge persists an email address whose
+// ownership has already been proven by a purpose-bound verification
+// challenge. The address and its verification state are written in the same
+// SQL UPDATE; generic user updates must continue to use UpdateUser, which
+// clears verification whenever the address changes.
+func UpdateUserEmailFromVerifiedChallenge(id string, verifiedEmail string, useEmailAsUsername bool) (*User, error) {
+	if !util.IsEmailValid(verifiedEmail) {
+		return nil, fmt.Errorf("verified email address is invalid")
+	}
+
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
+	if err != nil {
+		return nil, err
+	}
+	oldUser, err := getUser(owner, name)
+	if err != nil {
+		return nil, err
+	}
+	if oldUser == nil {
+		return nil, fmt.Errorf("the user: %s is not found", id)
+	}
+
+	updatedUser := *oldUser
+	updatedUser.Email = verifiedEmail
+	updatedUser.EmailVerified = true
+	columns := []string{"email", "email_verified", "updated_time"}
+	if useEmailAsUsername {
+		updatedUser.Name = verifiedEmail
+		columns = append(columns, "name")
+		if name != updatedUser.Name {
+			if err = userChangeTrigger(owner, name, updatedUser.Name); err != nil {
+				return nil, err
+			}
+		}
+	}
+	updatedUser.UpdatedTime = util.GetCurrentTime()
+
+	affected, err := updateUser(id, &updatedUser, columns)
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("verified email update did not modify user: %s", id)
+	}
+	return &updatedUser, nil
+}
+
+// EnableUserEmailMfaFromVerifiedChallenge binds email MFA only to the address
+// that was verified by the setup challenge. Email, email_verified and the MFA
+// enrollment state are persisted atomically.
+func EnableUserEmailMfaFromVerifiedChallenge(userId string, verifiedEmail string, recoveryCodes []string) (*User, error) {
+	if !util.IsEmailValid(verifiedEmail) {
+		return nil, fmt.Errorf("verified MFA email address is invalid")
+	}
+
+	owner, name, err := util.GetOwnerAndNameFromIdWithError(userId)
+	if err != nil {
+		return nil, err
+	}
+	oldUser, err := getUser(owner, name)
+	if err != nil {
+		return nil, err
+	}
+	if oldUser == nil {
+		return nil, fmt.Errorf("the user: %s is not found", userId)
+	}
+
+	updatedUser := *oldUser
+	updatedUser.Email = verifiedEmail
+	updatedUser.EmailVerified = true
+	updatedUser.MfaEmailEnabled = true
+	updatedUser.RecoveryCodes = append(append([]string{}, oldUser.RecoveryCodes...), recoveryCodes...)
+	if updatedUser.PreferredMfaType == "" {
+		updatedUser.PreferredMfaType = EmailType
+	}
+	updatedUser.UpdatedTime = util.GetCurrentTime()
+
+	columns := []string{
+		"email", "email_verified", "mfa_email_enabled", "recovery_codes",
+		"preferred_mfa_type", "updated_time",
+	}
+	affected, err := updateUser(userId, &updatedUser, columns)
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("verified email MFA update did not modify user: %s", userId)
+	}
+	return &updatedUser, nil
+}
+
 func updateUser(id string, user *User, columns []string) (int64, error) {
 	owner, name := util.GetOwnerAndNameFromIdNoCheck(id)
 	err := user.UpdateUserHash()
@@ -945,6 +1035,7 @@ func UpdateUserForAllFields(id string, user *User) (bool, error) {
 	if oldUser == nil {
 		return false, fmt.Errorf("the user: %s is not found", id)
 	}
+	applyEmailVerificationInvariant(oldUser, user, []string{"email"})
 
 	if name != user.Name {
 		err := userChangeTrigger(owner, name, user.Name)
