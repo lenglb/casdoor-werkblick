@@ -80,9 +80,11 @@ an absolute HTTPS reply URL (HTTP is accepted only for a loopback development
 URL). The request's `AssertionConsumerServiceURL` must then match that registered
 reply URL byte-for-byte. Shared applications cannot act as a SAML IdP.
 
-Password login requests with a non-empty password must declare exactly
-`signinMethod: "Password"` or `signinMethod: "LDAP"`, and that method must be
-enabled on the application. Empty and unknown methods fail before the local or
+Password login requests should declare exactly `signinMethod: "Password"` or
+`signinMethod: "LDAP"`, and that method must be enabled on the application. For
+wire compatibility with legacy Casdoor clients, an empty selector may use only
+local password authentication and only while password login is enabled; it
+never enables LDAP fallback. Unknown non-empty methods fail before the local or
 LDAP password checker. A `Password` method with the `Non-LDAP` rule continues to
 authenticate local users without enabling LDAP fallback.
 
