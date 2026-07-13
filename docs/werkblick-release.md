@@ -11,8 +11,11 @@ is published.
 2. Require the complete **Werkblick CI** workflow before changes can merge.
 3. Add a tag ruleset covering `werkblick-v*`. Restrict tag creation and deletion
    to the release maintainers. The release job refuses unprotected tags.
-4. Create the `ghcr-production` environment with a required reviewer and block
-   self-review.
+4. Create the `ghcr-production` environment with a required reviewer. In a
+   multi-operator team, block self-review. The currently accepted
+   single-operator exception permits `lenglb` to approve its own deployment
+   after the enforced 15-minute wait timer; treat this as a documented residual
+   risk and enable self-review prevention as soon as a second operator exists.
 5. Keep the workflow token default at read-only. The publish job alone receives
    `packages: write`, `id-token: write`, and `attestations: write`.
 6. Keep the GHCR package linked only to this repository. Do not add a PAT or a
