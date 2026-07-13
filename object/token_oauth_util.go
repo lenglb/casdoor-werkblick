@@ -1062,8 +1062,15 @@ func parseAndValidateSubjectToken(subjectToken string, requestingClientId string
 	}, nil, nil
 }
 
+func isExactRegisteredRedirectUri(application *Application, redirectUri string) bool {
+	if application == nil || redirectUri == "" {
+		return false
+	}
+	return slices.Contains(application.RedirectUris, redirectUri)
+}
+
 // createGuestUserToken creates a new guest user and returns a token for them.
-func createGuestUserToken(application *Application, clientSecret string, verifier string, hosts ...string) (*Token, *TokenError, error) {
+func createGuestUserToken(application *Application, clientSecret string, verifier string, redirectUri string, hosts ...string) (*Token, *TokenError, error) {
 	if clientSecret == "" ||
 		subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
 		return nil, &TokenError{
@@ -1124,6 +1131,11 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		RegisterType:      "Guest Signup",
 		RegisterSource:    fmt.Sprintf("%s/%s", application.Organization, application.Name),
 	}
+	if tokenError, accessErr := validateUserTokenAccess(application, guestUser); accessErr != nil {
+		return nil, nil, accessErr
+	} else if tokenError != nil {
+		return nil, tokenError, nil
+	}
 
 	affected, err := AddUser(guestUser, "en")
 	if err != nil {
@@ -1139,12 +1151,9 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		}, nil
 	}
 
-	err = ExtendUserWithRolesAndPermissions(guestUser)
-	if err != nil {
-		return nil, &TokenError{
-			Error:            EndpointError,
-			ErrorDescription: fmt.Sprintf("failed to extend user: %s", err.Error()),
-		}, nil
+	guestUser, tokenError, err := revalidateUserTokenAccess(application, guestUser)
+	if err != nil || tokenError != nil {
+		return nil, tokenError, err
 	}
 
 	authenticationContext, err := PreserveAuthenticationContext(AuthenticationContext{
@@ -1154,6 +1163,15 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(guestUser, "", authenticationContext); tokenError != nil {
+		return nil, tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(guestUser); err != nil {
+		return nil, &TokenError{
+			Error:            EndpointError,
+			ErrorDescription: fmt.Sprintf("failed to extend user: %s", err.Error()),
+		}, nil
 	}
 	host := ""
 	if len(hosts) > 0 {
@@ -1185,6 +1203,7 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		CodeChallenge: "",
 		CodeIsUsed:    true,
 		CodeExpireIn:  0,
+		RedirectUri:   redirectUri,
 	}
 	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
 		return nil, nil, err

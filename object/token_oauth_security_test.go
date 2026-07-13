@@ -640,3 +640,249 @@ func TestRefreshTokenReuseRevokesSuccessorFamily(t *testing.T) {
 		t.Fatalf("successor remained active after family reuse: %#v", storedSuccessor)
 	}
 }
+
+func TestIssuedClientCredentialsDPoPBindingRequiresGrantApplicationAndSubject(t *testing.T) {
+	newFixture := func() (*Application, *Token) {
+		application := &Application{
+			Owner:        "admin",
+			Name:         "machine-client",
+			Organization: "tenant",
+			GrantTypes:   []string{"client_credentials"},
+		}
+		return application, &Token{
+			Owner:        application.Owner,
+			Application:  application.Name,
+			Organization: application.Organization,
+			User:         application.Name,
+			Subject:      application.GetId(),
+			GrantType:    "client_credentials",
+		}
+	}
+
+	application, token := newFixture()
+	if tokenError := validateIssuedTokenDPoPBinding(application, token); tokenError != nil {
+		t.Fatalf("valid client credentials binding was rejected: %#v", tokenError)
+	}
+
+	tests := []struct {
+		name string
+		edit func(*Application, *Token)
+		want string
+	}{
+		{
+			name: "immutable subject mismatch",
+			edit: func(_ *Application, token *Token) { token.Subject = "admin/replacement-client" },
+			want: "does not identify",
+		},
+		{
+			name: "application mismatch",
+			edit: func(_ *Application, token *Token) { token.Application = "other-app" },
+			want: "does not belong",
+		},
+		{
+			name: "grant disabled",
+			edit: func(application *Application, _ *Token) { application.GrantTypes = nil },
+			want: "grant is no longer enabled",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			application, token := newFixture()
+			test.edit(application, token)
+			tokenError := validateIssuedTokenDPoPBinding(application, token)
+			if tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, test.want) {
+				t.Fatalf("binding error = %#v, want invalid_grant containing %q", tokenError, test.want)
+			}
+		})
+	}
+}
+
+func TestIssuedUserDPoPBindingAcceptsMatchingCurrentState(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	application := &Application{
+		Owner:        "admin",
+		Name:         "security-test-app",
+		Organization: tokenSecurityOrganization,
+		GrantTypes:   []string{"password"},
+	}
+	token := &Token{
+		Owner:                 application.Owner,
+		Application:           application.Name,
+		Organization:          tokenSecurityOrganization,
+		User:                  "alice",
+		Subject:               tokenSecurityUserID,
+		GrantType:             "password",
+		AuthTime:              time.Now().Unix(),
+		AuthenticationMethods: []string{"pwd"},
+	}
+
+	if tokenError := validateIssuedTokenDPoPBinding(application, token); tokenError != nil {
+		t.Fatalf("matching token binding was rejected: %#v", tokenError)
+	}
+	user, authenticationContext, tokenError, err := revalidateIssuedUserTokenForDPoP(application, token)
+	if err != nil || tokenError != nil {
+		t.Fatalf("matching user binding = (%#v, %v)", tokenError, err)
+	}
+	if user == nil || user.Id != tokenSecurityUserID || authenticationContext.Subject != user.GetId() {
+		t.Fatalf("matching user binding returned unexpected state: user=%#v context=%#v", user, authenticationContext)
+	}
+}
+
+func TestIssuedUserDPoPBindingRevalidatesSubjectAccessAndMfa(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *Application, *Token)
+		want      string
+	}{
+		{
+			name: "immutable subject mismatch",
+			configure: func(_ *testing.T, _ *Application, token *Token) {
+				token.Subject = "replacement-user-id"
+			},
+			want: "no longer identifies",
+		},
+		{
+			name: "application access disabled",
+			configure: func(_ *testing.T, application *Application, _ *Token) {
+				application.DisableSignin = true
+			},
+			want: "application has disabled",
+		},
+		{
+			name: "MFA enabled after initial mint",
+			configure: func(t *testing.T, _ *Application, _ *Token) {
+				affected, err := ormer.Engine.
+					Where("owner = ? AND name = ?", tokenSecurityOrganization, "alice").
+					Cols("totp_secret").
+					Update(&User{TotpSecret: "enrolled-after-mint"})
+				if err != nil || affected != 1 {
+					t.Fatalf("enable persisted MFA = (%d, %v)", affected, err)
+				}
+			},
+			want: "multi-factor authentication",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupTokenSecurityTestOrmer(t)
+			application := &Application{
+				Owner:        "admin",
+				Name:         "security-test-app",
+				Organization: tokenSecurityOrganization,
+				GrantTypes:   []string{"password"},
+			}
+			token := &Token{
+				Owner:                 application.Owner,
+				Application:           application.Name,
+				Organization:          tokenSecurityOrganization,
+				User:                  "alice",
+				Subject:               tokenSecurityUserID,
+				GrantType:             "password",
+				AuthTime:              time.Now().Unix(),
+				AuthenticationMethods: []string{"pwd"},
+			}
+			test.configure(t, application, token)
+
+			user, _, tokenError, err := revalidateIssuedUserTokenForDPoP(application, token)
+			if err != nil {
+				t.Fatalf("revalidation returned internal error: %v", err)
+			}
+			if user != nil || tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, test.want) {
+				t.Fatalf("revalidation = (%#v, %#v), want invalid_grant containing %q", user, tokenError, test.want)
+			}
+		})
+	}
+}
+
+func TestGuestAuthorizationRequiresExactRegisteredRedirect(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	application := &Application{
+		Owner:             "admin",
+		Name:              "guest-app",
+		Organization:      tokenSecurityOrganization,
+		ClientSecret:      "guest-secret",
+		GrantTypes:        []string{"authorization_code"},
+		RedirectUris:      []string{tokenSecurityRedirect},
+		EnableGuestSignin: true,
+		EnableSignUp:      true,
+	}
+
+	for _, redirectUri := range []string{"", "https://attacker.example.test/callback"} {
+		result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, application.ClientSecret, "guest-user", "", redirectUri, "")
+		if err != nil {
+			t.Fatalf("redirect %q returned internal error: %v", redirectUri, err)
+		}
+		if result != nil || tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, "exact registered redirect_uri") {
+			t.Fatalf("redirect %q result = (%#v, %#v), want invalid_grant", redirectUri, result, tokenError)
+		}
+	}
+
+	application.GrantTypes = nil
+	result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, application.ClientSecret, "guest-user", "", tokenSecurityRedirect, "")
+	if err != nil {
+		t.Fatalf("disabled grant returned internal error: %v", err)
+	}
+	if result != nil || tokenError == nil || tokenError.Error != UnsupportedGrantType {
+		t.Fatalf("disabled grant result = (%#v, %#v), want unsupported_grant_type", result, tokenError)
+	}
+}
+
+func TestGuestAuthorizationRevalidatesAccessAndMfaBeforeCreatingUser(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*testing.T, *Application)
+		want      string
+	}{
+		{
+			name: "application sign-in disabled",
+			configure: func(_ *testing.T, application *Application) {
+				application.DisableSignin = true
+			},
+			want: "application has disabled",
+		},
+		{
+			name: "required MFA enrollment missing",
+			configure: func(t *testing.T, _ *Application) {
+				affected, err := ormer.Engine.
+					Where("owner = ? AND name = ?", "admin", tokenSecurityOrganization).
+					Cols("mfa_items").
+					Update(&Organization{MfaItems: []*MfaItem{{Name: TotpType, Rule: "Required"}}})
+				if err != nil || affected != 1 {
+					t.Fatalf("require organization MFA = (%d, %v)", affected, err)
+				}
+			},
+			want: "required MFA enrollment",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupTokenSecurityTestOrmer(t)
+			application := &Application{
+				Owner:             "admin",
+				Name:              "guest-app",
+				Organization:      tokenSecurityOrganization,
+				ClientSecret:      "guest-secret",
+				GrantTypes:        []string{"authorization_code"},
+				RedirectUris:      []string{tokenSecurityRedirect},
+				EnableGuestSignin: true,
+				EnableSignUp:      true,
+			}
+			test.configure(t, application)
+
+			result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, application.ClientSecret, "guest-user", "", tokenSecurityRedirect, "")
+			if err != nil {
+				t.Fatalf("guest authorization returned internal error: %v", err)
+			}
+			if result != nil || tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, test.want) {
+				t.Fatalf("guest authorization = (%#v, %#v), want invalid_grant containing %q", result, tokenError, test.want)
+			}
+			count, countErr := ormer.Engine.Where("tag = ?", "guest-user").Count(new(User))
+			if countErr != nil || count != 0 {
+				t.Fatalf("denied guest authorization created %d users: %v", count, countErr)
+			}
+		})
+	}
+}

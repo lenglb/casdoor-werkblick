@@ -251,6 +251,9 @@ func bindIssuedTokenToDPoP(application *Application, token *Token, dpopJkt strin
 	if token == nil || dpopJkt == "" {
 		return nil, nil
 	}
+	if tokenError := validateIssuedTokenDPoPBinding(application, token); tokenError != nil {
+		return tokenError, nil
+	}
 
 	var accessToken, refreshToken string
 	var err error
@@ -265,19 +268,9 @@ func bindIssuedTokenToDPoP(application *Application, token *Token, dpopJkt strin
 			application, nullUser, "", "", nil, dpopJkt, token.Nonce, token.Scope, token.Resource, host, token.Name,
 		)
 	} else {
-		authenticationContext, contextErr := token.GetAuthenticationContext()
-		if contextErr != nil {
-			return &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: fmt.Sprintf("issued token authentication context is invalid: %s", contextErr.Error()),
-			}, nil
-		}
-		user, userErr := getUser(token.Organization, token.User)
-		if userErr != nil {
-			return nil, userErr
-		}
-		if user == nil {
-			return &TokenError{Error: InvalidGrant, ErrorDescription: "issued token user no longer exists"}, nil
+		user, authenticationContext, tokenError, userErr := revalidateIssuedUserTokenForDPoP(application, token)
+		if userErr != nil || tokenError != nil {
+			return tokenError, userErr
 		}
 		if userErr = ExtendUserWithRolesAndPermissions(user); userErr != nil {
 			return nil, userErr
@@ -307,6 +300,57 @@ func bindIssuedTokenToDPoP(application *Application, token *Token, dpopJkt strin
 	token.TokenType = "DPoP"
 	token.DPoPJkt = dpopJkt
 	return nil, nil
+}
+
+func validateIssuedTokenDPoPBinding(application *Application, token *Token) *TokenError {
+	if application == nil || token == nil {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "issued token cannot be bound without its application"}
+	}
+	if token.Owner != application.Owner || token.Application != application.Name {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "issued token does not belong to the authenticated application"}
+	}
+	if token.GrantType == "" || !IsGrantTypeValid(token.GrantType, application.GrantTypes) {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "issued token grant is no longer enabled for the application"}
+	}
+	if token.GrantType == "client_credentials" &&
+		(token.Subject != application.GetId() || token.User != application.Name || token.Organization != application.Organization) {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "issued client credentials token does not identify the authenticated application"}
+	}
+	return nil
+}
+
+// revalidateIssuedUserTokenForDPoP treats DPoP binding as a new user-token
+// minting boundary. The persisted immutable subject, current durable access
+// policy, and current MFA assurance must all still match before replacement.
+func revalidateIssuedUserTokenForDPoP(application *Application, token *Token) (*User, AuthenticationContext, *TokenError, error) {
+	if token == nil || token.Subject == "" {
+		return nil, AuthenticationContext{}, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "issued token has no immutable subject binding",
+		}, nil
+	}
+
+	user, tokenError, err := revalidateUserTokenAccess(application, &User{
+		Owner: token.Organization,
+		Name:  token.User,
+		Id:    token.Subject,
+	})
+	if err != nil || tokenError != nil {
+		return nil, AuthenticationContext{}, tokenError, err
+	}
+
+	authenticationContext, contextErr := token.GetAuthenticationContext()
+	if contextErr != nil {
+		return nil, AuthenticationContext{}, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("issued token authentication context is invalid: %s", contextErr.Error()),
+		}, nil
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, token.Scope, authenticationContext); tokenError != nil {
+		return nil, AuthenticationContext{}, tokenError, nil
+	}
+
+	return user, authenticationContext, nil, nil
 }
 
 // GetAuthorizationCodeToken handles the Authorization Code Grant flow.
@@ -366,7 +410,13 @@ func getAuthorizationCodeToken(application *Application, clientSecret string, co
 				ErrorDescription: "sign up is not enabled for this application",
 			}, nil
 		}
-		return createGuestUserToken(application, clientSecret, verifier, host)
+		if !isExactRegisteredRedirectUri(application, redirectUri) {
+			return nil, &TokenError{
+				Error:            InvalidGrant,
+				ErrorDescription: "guest-user authorization requires an exact registered redirect_uri",
+			}, nil
+		}
+		return createGuestUserToken(application, clientSecret, verifier, redirectUri, host)
 	}
 
 	token, err := getTokenByCode(code)

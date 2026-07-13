@@ -46,6 +46,11 @@ func TestIsRequiredMfaTypeUsesUserOverrideAndEnrollmentState(t *testing.T) {
 	if IsRequiredMfaType(organization, user, TotpType) {
 		t.Fatal("organization rule leaked through user-level override")
 	}
+
+	user.MfaItems = []*MfaItem{nil}
+	if !IsNeedPromptMfa(organization, user) {
+		t.Fatal("nil user-level MFA override bypassed the organization requirement")
+	}
 }
 
 func TestMfaEnabledStateDoesNotDependOnPreferredType(t *testing.T) {
