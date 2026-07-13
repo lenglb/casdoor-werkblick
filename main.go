@@ -17,6 +17,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 
 	"github.com/beego/beego/v2/core/logs"
 	"github.com/beego/beego/v2/server/web"
@@ -33,7 +35,102 @@ import (
 	"github.com/casdoor/casdoor/util"
 )
 
+const (
+	schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
+	bootstrapDataOnlyEnv   = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+)
+
+type startupMode string
+
+const (
+	startupModeNormal        startupMode = "normal"
+	startupModeSchemaOnly    startupMode = "schema-only"
+	startupModeBootstrapOnly startupMode = "bootstrap-data-only"
+)
+
+type startupHooks struct {
+	configureSession func()
+	initAPI          func()
+	initFlag         func()
+	initAdapter      func()
+	createTables     func()
+	initDb           func()
+	initFromFile     func()
+	startNormalBoot  func()
+}
+
+func parseStartupBoolean(name string, value string) (bool, error) {
+	switch value {
+	case "", "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("%s must be empty, false, or true; got %q", name, value)
+	}
+}
+
+// runStartup validates both one-shot controls before any initialization hook.
+// Typos fail closed instead of starting a listener before the intended
+// migration or bootstrap quarantine has run.
+func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks startupHooks) (startupMode, error) {
+	migrationOnly, err := parseStartupBoolean(schemaMigrationOnlyEnv, migrationOnlyValue)
+	if err != nil {
+		return "", err
+	}
+	bootstrapOnly, err := parseStartupBoolean(bootstrapDataOnlyEnv, bootstrapOnlyValue)
+	if err != nil {
+		return "", err
+	}
+	if migrationOnly && bootstrapOnly {
+		return "", fmt.Errorf("%s and %s are mutually exclusive", schemaMigrationOnlyEnv, bootstrapDataOnlyEnv)
+	}
+
+	if !migrationOnly && !bootstrapOnly {
+		// Beego snapshots SessionOn into each route as it is registered.
+		// Configure sessions before InitAPI so normal routes receive a store.
+		hooks.configureSession()
+	}
+	hooks.initAPI()
+	hooks.initFlag()
+	hooks.initAdapter()
+	hooks.createTables()
+
+	if migrationOnly {
+		return startupModeSchemaOnly, nil
+	}
+	if bootstrapOnly {
+		hooks.initFromFile()
+		hooks.initDb()
+		return startupModeBootstrapOnly, nil
+	}
+
+	hooks.startNormalBoot()
+	return startupModeNormal, nil
+}
+
 func main() {
+	mode, err := runStartup(os.Getenv(schemaMigrationOnlyEnv), os.Getenv(bootstrapDataOnlyEnv), startupHooks{
+		configureSession: configureSession,
+		initAPI:          routers.InitAPI,
+		initFlag:         object.InitFlag,
+		initAdapter:      object.InitAdapter,
+		createTables:     object.CreateTables,
+		initDb:           object.InitDb,
+		initFromFile:     object.InitFromFileRequired,
+		startNormalBoot:  startNormalBoot,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if mode == startupModeSchemaOnly {
+		log.Printf("schema migration completed; %s=true, exiting before service initialization", schemaMigrationOnlyEnv)
+	} else if mode == startupModeBootstrapOnly {
+		log.Printf("bootstrap data import completed; %s=true, exiting before service initialization", bootstrapDataOnlyEnv)
+	}
+}
+
+func configureSession() {
 	web.BConfig.WebConfig.Session.SessionOn = true
 	web.BConfig.WebConfig.Session.SessionName = "casdoor_session_id"
 	if conf.GetConfigString("redisEndpoint") == "" {
@@ -50,12 +147,9 @@ func main() {
 	web.BConfig.WebConfig.Session.SessionCookieLifeTime = sessionCookieLifeTime
 	web.BConfig.WebConfig.Session.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
 	// web.BConfig.WebConfig.Session.SessionCookieSameSite = http.SameSiteNoneMode
+}
 
-	routers.InitAPI()
-	object.InitFlag()
-	object.InitAdapter()
-	object.CreateTables()
-
+func startNormalBoot() {
 	object.InitDb()
 
 	// Handle export command

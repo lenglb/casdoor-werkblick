@@ -165,11 +165,53 @@ func pkceChallenge(verifier string) string {
 	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(sum[:])
 }
 
-// IsGrantTypeValid checks if grantType is allowed in the current application.
-// authorization_code is allowed by default.
+var supportedOAuthGrantTypes = map[string]struct{}{
+	"authorization_code": {},
+	"password":           {},
+	"client_credentials": {},
+	"token":              {},
+	"id_token":           {},
+	"refresh_token":      {},
+	"urn:ietf:params:oauth:grant-type:jwt-bearer":     {},
+	"urn:ietf:params:oauth:grant-type:device_code":    {},
+	"urn:ietf:params:oauth:grant-type:token-exchange": {},
+}
+
+func IsSupportedOAuthGrantType(grantType string) bool {
+	_, ok := supportedOAuthGrantTypes[grantType]
+	return ok
+}
+
+func ValidateOAuthGrantTypes(grantTypes []string) error {
+	seen := make(map[string]struct{}, len(grantTypes))
+	for _, grantType := range grantTypes {
+		if !IsSupportedOAuthGrantType(grantType) {
+			return fmt.Errorf("unsupported OAuth grant type: %q", grantType)
+		}
+		if _, ok := seen[grantType]; ok {
+			return fmt.Errorf("OAuth grant type is duplicated: %q", grantType)
+		}
+		seen[grantType] = struct{}{}
+	}
+	return nil
+}
+
+func ValidateOAuthNonceForGrant(grantType string, nonce string) *TokenError {
+	if grantType == "id_token" && strings.TrimSpace(nonce) == "" {
+		return &TokenError{
+			Error:            InvalidRequest,
+			ErrorDescription: "nonce is required for id_token issuance",
+		}
+	}
+	return nil
+}
+
+// IsGrantTypeValid checks if grantType is both implemented by the server and
+// explicitly allowed in the current application. An empty allowlist rejects
+// every grant type.
 func IsGrantTypeValid(method string, grantTypes []string) bool {
-	if method == "authorization_code" {
-		return true
+	if !IsSupportedOAuthGrantType(method) {
+		return false
 	}
 	for _, m := range grantTypes {
 		if m == method {
@@ -188,17 +230,26 @@ func isRegexScope(scope string) bool {
 // against the application's configured scopes. Literal scopes are kept as-is
 // after verifying they exist in the allowed list. Regex scopes are matched
 // against every allowed scope name; all matches replace the pattern.
-// If the application has no defined scopes, the original scope string is
-// returned unchanged (backward-compatible behaviour).
+// If the application has no defined scopes, only an empty scope request is
+// accepted.
 // Returns the expanded scope string and whether the scope is valid.
 func IsScopeValidAndExpand(scope string, application *Application) (string, bool) {
-	if len(application.Scopes) == 0 || scope == "" {
+	if application == nil {
+		return "", false
+	}
+	if scope == "" {
 		return scope, true
+	}
+	if len(application.Scopes) == 0 {
+		return "", false
 	}
 
 	allowedNames := make([]string, 0, len(application.Scopes))
 	allowedSet := make(map[string]bool, len(application.Scopes))
 	for _, s := range application.Scopes {
+		if s == nil {
+			continue
+		}
 		allowedNames = append(allowedNames, s.Name)
 		allowedSet[s.Name] = true
 	}
@@ -247,11 +298,27 @@ func IsScopeValidAndExpand(scope string, application *Application) (string, bool
 
 // IsScopeValid checks whether all space-separated scopes in the scope string
 // are defined in the application's Scopes list (including regex expansion).
-// If the application has no defined scopes, every scope is considered valid
-// (backward-compatible behaviour).
+// If the application has no defined scopes, only an empty scope is valid.
 func IsScopeValid(scope string, application *Application) bool {
 	_, ok := IsScopeValidAndExpand(scope, application)
 	return ok
+}
+
+func ValidateDeviceAuthorizationRequest(application *Application, scope string) (string, *TokenError) {
+	if application == nil || !IsGrantTypeValid("urn:ietf:params:oauth:grant-type:device_code", application.GrantTypes) {
+		return "", &TokenError{
+			Error:            UnauthorizedClient,
+			ErrorDescription: "device_code grant is not enabled for this application",
+		}
+	}
+	expandedScope, ok := IsScopeValidAndExpand(scope, application)
+	if !ok {
+		return "", &TokenError{
+			Error:            InvalidScope,
+			ErrorDescription: "the requested scope is invalid or not defined in the application",
+		}
+	}
+	return expandedScope, nil
 }
 
 func ExpireTokenByAccessToken(accessToken string) (bool, *Application, *Token, error) {
@@ -278,7 +345,8 @@ func ExpireTokenByAccessToken(accessToken string) (bool, *Application, *Token, e
 }
 
 func CheckOAuthLogin(clientId string, responseType string, redirectUri string, scope string, state string, lang string) (string, *Application, error) {
-	if responseType != "code" && responseType != "token" && responseType != "id_token" {
+	requiredGrant, supportedResponseType := requiredGrantForOAuthResponseType(responseType)
+	if !supportedResponseType {
 		return fmt.Sprintf(i18n.Translate(lang, "token:Grant_type: %s is not supported in this application"), responseType), nil, nil
 	}
 
@@ -289,6 +357,9 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 
 	if application == nil {
 		return i18n.Translate(lang, "token:Invalid client_id"), nil, nil
+	}
+	if !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return fmt.Sprintf(i18n.Translate(lang, "token:Grant_type: %s is not supported in this application"), requiredGrant), application, nil
 	}
 
 	if !application.IsRedirectUriValid(redirectUri) {
@@ -304,6 +375,17 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 	return "", application, nil
 }
 
+func requiredGrantForOAuthResponseType(responseType string) (string, bool) {
+	switch responseType {
+	case "code":
+		return "authorization_code", true
+	case "token", "id_token":
+		return responseType, true
+	default:
+		return "", false
+	}
+}
+
 // GetOAuthCode is retained for source compatibility with integrations compiled
 // against the legacy API. Provider and sign-in labels are not trusted
 // authentication evidence, so legacy issuance fails closed. Callers must move
@@ -314,6 +396,17 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 }
 
 func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authenticationContext AuthenticationContext, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, host string, lang string) (*Code, error) {
+	msg, application, err := CheckOAuthLogin(clientId, responseType, redirectUri, scope, state, lang)
+	if err != nil {
+		return nil, err
+	}
+	if msg != "" {
+		return &Code{
+			Message: msg,
+			Code:    "",
+		}, nil
+	}
+
 	user, err := GetUser(userId)
 	if err != nil {
 		return nil, err
@@ -340,18 +433,6 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		return nil, fmt.Errorf("authentication context subject %q does not match user %q", authenticationContext.Subject, user.GetId())
 	}
 
-	msg, application, err := CheckOAuthLogin(clientId, responseType, redirectUri, scope, state, lang)
-	if err != nil {
-		return nil, err
-	}
-
-	if msg != "" {
-		return &Code{
-			Message: msg,
-			Code:    "",
-		}, nil
-	}
-
 	// Expand regex/wildcard scopes to concrete scope names.
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
@@ -361,6 +442,16 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		}, nil
 	}
 	scope = expandedScope
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil {
+		return nil, err
+	}
+	if tokenError != nil {
+		return &Code{Message: fmt.Sprintf("error: %s", tokenError.ErrorDescription), Code: ""}, nil
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, authenticationContext); tokenError != nil {
+		return &Code{Message: fmt.Sprintf("error: %s", tokenError.ErrorDescription), Code: ""}, nil
+	}
 
 	// Validate resource parameter (RFC 8707)
 	if err := validateResourceURI(resource); err != nil {
@@ -390,6 +481,7 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		Application:   application.Name,
 		Organization:  user.Owner,
 		User:          user.Name,
+		Subject:       user.Id,
 		Code:          util.GenerateClientId(),
 		AccessToken:   accessToken,
 		RefreshToken:  refreshToken,
@@ -397,7 +489,9 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		Scope:         scope,
 		Nonce:         nonce,
 		TokenType:     "Bearer",
+		GrantType:     "authorization_code",
 		CodeChallenge: challenge,
+		RedirectUri:   redirectUri,
 		CodeIsUsed:    false,
 		CodeExpireIn:  time.Now().Add(time.Minute * 5).Unix(),
 		Resource:      resource,
@@ -437,6 +531,12 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 				ErrorDescription: "client_id is invalid",
 			}, nil
 		}
+	}
+	if !IsGrantTypeValid("refresh_token", application.GrantTypes) {
+		return &TokenError{
+			Error:            UnsupportedGrantType,
+			ErrorDescription: "refresh_token is not enabled for this application",
+		}, nil
 	}
 
 	// check whether the refresh token is valid, and has not expired.
@@ -544,6 +644,12 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 			ErrorDescription: "refresh token authentication evidence does not match the persisted grant",
 		}, nil
 	}
+	if token.Subject == "" || oldToken.Subject != token.Subject {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token subject does not match the persisted immutable subject",
+		}, nil
+	}
 
 	if scope == "" {
 		scope = token.Scope
@@ -578,7 +684,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 	if user == nil {
 		return "", fmt.Errorf("The user: %s doesn't exist", util.GetId(token.Organization, token.User))
 	}
-	if oldToken.Subject != user.Id {
+	if oldToken.Subject != user.Id || token.Subject != user.Id {
 		return &TokenError{
 			Error:            InvalidGrant,
 			ErrorDescription: "refresh token subject does not match the persisted user",
@@ -593,17 +699,18 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		return tokenError, nil
 	}
 
-	err = ExtendUserWithRolesAndPermissions(user)
-	if err != nil {
-		return nil, err
-	}
-
 	authenticationContext, err := token.GetAuthenticationContext()
 	if err != nil {
 		return &TokenError{
 			Error:            InvalidGrant,
 			ErrorDescription: fmt.Sprintf("refresh token authentication context is invalid: %s", err.Error()),
 		}, nil
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, authenticationContext); tokenError != nil {
+		return tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(user); err != nil {
+		return nil, err
 	}
 
 	newTokenType := "Bearer"
@@ -655,6 +762,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		Application:        application.Name,
 		Organization:       user.Owner,
 		User:               user.Name,
+		Subject:            user.Id,
 		Code:               util.GenerateClientId(),
 		AccessToken:        newAccessToken,
 		RefreshToken:       newRefreshToken,
@@ -663,6 +771,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		TokenType:          newTokenType,
 		GrantType:          "refresh_token",
 		CodeChallenge:      token.CodeChallenge,
+		RedirectUri:        token.RedirectUri,
 		Resource:           token.Resource,
 		DPoPJkt:            newDPoPJkt,
 		RefreshTokenFamily: token.RefreshTokenFamily,
@@ -824,7 +933,10 @@ func mintImplicitToken(application *Application, username string, scope string, 
 	return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
 }
 
-func mintImplicitTokenWithAuthenticationContext(application *Application, username string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, *TokenError, error) {
+func mintImplicitTokenWithAuthenticationContext(application *Application, username string, requiredGrant string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: fmt.Sprintf("%s is not enabled for this application", requiredGrant)}, nil
+	}
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -853,7 +965,7 @@ func mintImplicitTokenWithAuthenticationContext(application *Application, userna
 	if authenticationContext == nil {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
 	}
-	token, err := GetTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, *authenticationContext)
+	token, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, requiredGrant, scope, nonce, host, *authenticationContext)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -918,6 +1030,9 @@ func parseAndValidateSubjectToken(subjectToken string, requestingClientId string
 	if tokenType != "access-token" {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token is not an access token"}, nil
 	}
+	if record.Subject == "" || subject != record.Subject {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token subject does not match the persisted immutable subject"}, nil
+	}
 	if azp != issuingApp.ClientId || signedScope != record.Scope {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token claims do not match the persisted grant"}, nil
 	}
@@ -947,8 +1062,15 @@ func parseAndValidateSubjectToken(subjectToken string, requestingClientId string
 	}, nil, nil
 }
 
+func isExactRegisteredRedirectUri(application *Application, redirectUri string) bool {
+	if application == nil || redirectUri == "" {
+		return false
+	}
+	return slices.Contains(application.RedirectUris, redirectUri)
+}
+
 // createGuestUserToken creates a new guest user and returns a token for them.
-func createGuestUserToken(application *Application, clientSecret string, verifier string, hosts ...string) (*Token, *TokenError, error) {
+func createGuestUserToken(application *Application, clientSecret string, verifier string, redirectUri string, hosts ...string) (*Token, *TokenError, error) {
 	if clientSecret == "" ||
 		subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
 		return nil, &TokenError{
@@ -1009,6 +1131,11 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		RegisterType:      "Guest Signup",
 		RegisterSource:    fmt.Sprintf("%s/%s", application.Organization, application.Name),
 	}
+	if tokenError, accessErr := validateUserTokenAccess(application, guestUser); accessErr != nil {
+		return nil, nil, accessErr
+	} else if tokenError != nil {
+		return nil, tokenError, nil
+	}
 
 	affected, err := AddUser(guestUser, "en")
 	if err != nil {
@@ -1024,12 +1151,9 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		}, nil
 	}
 
-	err = ExtendUserWithRolesAndPermissions(guestUser)
-	if err != nil {
-		return nil, &TokenError{
-			Error:            EndpointError,
-			ErrorDescription: fmt.Sprintf("failed to extend user: %s", err.Error()),
-		}, nil
+	guestUser, tokenError, err := revalidateUserTokenAccess(application, guestUser)
+	if err != nil || tokenError != nil {
+		return nil, tokenError, err
 	}
 
 	authenticationContext, err := PreserveAuthenticationContext(AuthenticationContext{
@@ -1039,6 +1163,15 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 	})
 	if err != nil {
 		return nil, nil, err
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(guestUser, "", authenticationContext); tokenError != nil {
+		return nil, tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(guestUser); err != nil {
+		return nil, &TokenError{
+			Error:            EndpointError,
+			ErrorDescription: fmt.Sprintf("failed to extend user: %s", err.Error()),
+		}, nil
 	}
 	host := ""
 	if len(hosts) > 0 {
@@ -1059,15 +1192,18 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		Application:   application.Name,
 		Organization:  guestUser.Owner,
 		User:          guestUser.Name,
+		Subject:       guestUser.Id,
 		Code:          util.GenerateClientId(),
 		AccessToken:   accessToken,
 		RefreshToken:  refreshToken,
 		ExpiresIn:     int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:         "",
 		TokenType:     "Bearer",
+		GrantType:     "authorization_code",
 		CodeChallenge: "",
 		CodeIsUsed:    true,
 		CodeExpireIn:  0,
+		RedirectUri:   redirectUri,
 	}
 	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
 		return nil, nil, err

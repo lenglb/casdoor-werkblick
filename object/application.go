@@ -102,6 +102,7 @@ type Application struct {
 	EnableAutoSignin             bool            `json:"enableAutoSignin"`
 	EnableCodeSignin             bool            `json:"enableCodeSignin"`
 	EnableExclusiveSignin        bool            `json:"enableExclusiveSignin"`
+	EnableSaml                   bool            `xorm:"default false" json:"enableSaml"`
 	EnableSamlCompress           bool            `json:"enableSamlCompress"`
 	EnableSamlC14n10             bool            `json:"enableSamlC14n10"`
 	EnableSamlPostBinding        bool            `json:"enableSamlPostBinding"`
@@ -417,6 +418,9 @@ func GetApplication(id string) (*Application, error) {
 }
 
 func UpdateApplication(id string, application *Application, isGlobalAdmin bool, lang string, columns []string) (bool, error) {
+	if err := ValidateOAuthGrantTypes(application.GrantTypes); err != nil {
+		return false, err
+	}
 	owner, name, err := util.GetOwnerAndNameFromIdWithError(id)
 	if err != nil {
 		return false, err
@@ -452,6 +456,11 @@ func UpdateApplication(id string, application *Application, isGlobalAdmin bool, 
 
 	if application.IsShared == true && application.Organization != "built-in" {
 		return false, fmt.Errorf("only applications belonging to built-in organization can be shared")
+	}
+	if application.EnableSaml {
+		if err = ValidateSamlIdpApplication(application); err != nil {
+			return false, err
+		}
 	}
 
 	err = checkMultipleCaptchaProviders(application, lang)
@@ -489,6 +498,9 @@ func UpdateApplication(id string, application *Application, isGlobalAdmin bool, 
 }
 
 func AddApplication(application *Application) (bool, error) {
+	if err := ValidateOAuthGrantTypes(application.GrantTypes); err != nil {
+		return false, err
+	}
 	if application.Owner == "" {
 		application.Owner = "admin"
 	}
@@ -504,6 +516,11 @@ func AddApplication(application *Application) (bool, error) {
 		}
 	} else {
 		application.ClientSecret = ""
+	}
+	if application.EnableSaml {
+		if err := ValidateSamlIdpApplication(application); err != nil {
+			return false, err
+		}
 	}
 
 	app, err := GetApplicationByClientId(application.ClientId)

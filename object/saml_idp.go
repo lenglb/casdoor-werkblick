@@ -40,6 +40,9 @@ import (
 // NewSamlResponse
 // returns a saml2 response
 func NewSamlResponse(application *Application, user *User, host string, certificate string, destination string, iss string, requestId string, redirectUri []string) (*etree.Element, error) {
+	if _, err := ValidateSamlAssertionConsumerServiceURL(application, destination); err != nil {
+		return nil, err
+	}
 	samlResponse := &etree.Element{
 		Space: "samlp",
 		Tag:   "Response",
@@ -225,6 +228,9 @@ type Attribute struct {
 }
 
 func GetSamlMeta(application *Application, host string, enablePostBinding bool) (*IdpEntityDescriptor, error) {
+	if err := ValidateSamlIdpApplication(application); err != nil {
+		return nil, err
+	}
 	cert, err := getCertByApplication(application)
 	if err != nil {
 		return nil, err
@@ -296,6 +302,9 @@ func GetSamlMeta(application *Application, host string, enablePostBinding bool) 
 // GetSamlResponse generates a SAML2.0 response
 // parameter samlRequest is saml request in base64 format
 func GetSamlResponse(application *Application, user *User, samlRequest string, host string) (string, string, string, error) {
+	if err := ValidateSamlIdpApplication(application); err != nil {
+		return "", "", "", err
+	}
 	// request type
 	method := "GET"
 	samlRequest = strings.ReplaceAll(samlRequest, " ", "+")
@@ -352,13 +361,13 @@ func GetSamlResponse(application *Application, user *User, samlRequest string, h
 	block, _ := pem.Decode([]byte(cert.Certificate))
 	certificate := base64.StdEncoding.EncodeToString(block.Bytes)
 
-	// redirect Url (Assertion Consumer Url)
-	if application.SamlReplyUrl != "" {
-		method = "POST"
-		authnRequest.AssertionConsumerServiceURL = application.SamlReplyUrl
-	} else if authnRequest.AssertionConsumerServiceURL == "" {
-		return "", "", "", fmt.Errorf("err: SAML request don't has attribute 'AssertionConsumerServiceURL' in <samlp:AuthnRequest>")
+	// The request ACS is attacker-controlled input. Never override or accept it
+	// loosely: it must exactly equal the tenant-bound registered reply URL.
+	authnRequest.AssertionConsumerServiceURL, err = ValidateSamlAssertionConsumerServiceURL(application, authnRequest.AssertionConsumerServiceURL)
+	if err != nil {
+		return "", "", "", err
 	}
+	method = "POST"
 	if authnRequest.ProtocolBinding == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST" {
 		method = "POST"
 	}
@@ -451,6 +460,9 @@ func GetSamlResponse(application *Application, user *User, samlRequest string, h
 
 // NewSamlResponse11 return a saml1.1 response(not 2.0)
 func NewSamlResponse11(application *Application, user *User, requestID string, host string) (*etree.Element, error) {
+	if err := ValidateSamlIdpApplication(application); err != nil {
+		return nil, err
+	}
 	samlResponse := &etree.Element{
 		Space: "samlp",
 		Tag:   "Response",

@@ -592,6 +592,12 @@ func IsNeedPromptMfa(org *Organization, user *User) bool {
 		mfaItems = user.MfaItems
 	}
 	for _, item := range mfaItems {
+		// A malformed effective MFA override must never erase an organization
+		// requirement. There is no safe factor to infer from a nil item, so force
+		// the enrollment gate to fail closed until the policy is repaired.
+		if item == nil {
+			return true
+		}
 		if IsRequiredMfaType(org, user, item.Name) {
 			return true
 		}
@@ -608,7 +614,7 @@ func IsRequiredMfaType(org *Organization, user *User, mfaType string) bool {
 		mfaItems = user.MfaItems
 	}
 	for _, item := range mfaItems {
-		if item.Rule != "Required" || item.Name != mfaType {
+		if item == nil || item.Rule != "Required" || item.Name != mfaType {
 			continue
 		}
 		switch mfaType {

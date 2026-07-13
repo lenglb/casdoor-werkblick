@@ -15,6 +15,9 @@
 package object
 
 import (
+	"fmt"
+	"strings"
+
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
 )
@@ -56,6 +59,10 @@ type InitData struct {
 var initDataNewOnly bool
 
 func InitFromFile() {
+	initFromFile(false)
+}
+
+func initFromFile(requireSecureBootstrap bool) {
 	initDataFile := conf.GetConfigString("initDataFile")
 	if initDataFile == "" {
 		return
@@ -69,6 +76,14 @@ func InitFromFile() {
 	}
 
 	if initData != nil {
+		if err = validateInitData(initData, requireSecureBootstrap); err != nil {
+			panic(err)
+		}
+		if !initDataNewOnly {
+			if err = ensureInitDataImportTargetEmpty(); err != nil {
+				panic(err)
+			}
+		}
 		for _, organization := range initData.Organizations {
 			initDefinedOrganization(organization)
 		}
@@ -154,6 +169,129 @@ func InitFromFile() {
 		for _, link := range initData.ThirdPartyLinks {
 			initThirdPartyLinks(link)
 		}
+	}
+}
+
+// InitFromFileRequired is used by the one-shot bootstrap mode. A successful
+// bootstrap must never be reported when the configured, mounted init-data file
+// is missing.
+func InitFromFileRequired() {
+	initDataFile := conf.GetConfigString("initDataFile")
+	if initDataFile == "" {
+		panic("initDataFile must be configured for bootstrap-data-only mode")
+	}
+	if !util.FileExist(initDataFile) {
+		panic("configured initDataFile does not exist for bootstrap-data-only mode")
+	}
+
+	initFromFile(true)
+}
+
+func validateInitData(data *InitData, requireSecureBootstrap bool) error {
+	if data == nil {
+		return fmt.Errorf("init data must not be nil")
+	}
+	entityCount := len(data.Organizations) + len(data.Applications) + len(data.Users) +
+		len(data.Certs) + len(data.Providers) + len(data.Ldaps) + len(data.Models) +
+		len(data.Permissions) + len(data.Payments) + len(data.Products) + len(data.Resources) +
+		len(data.Roles) + len(data.Syncers) + len(data.Tokens) + len(data.Webhooks) +
+		len(data.Groups) + len(data.Adapters) + len(data.Enforcers) + len(data.Plans) +
+		len(data.Pricings) + len(data.Invitations) + len(data.Records) + len(data.Sessions) +
+		len(data.Subscriptions) + len(data.Transactions) + len(data.Sites) + len(data.Rules) +
+		len(data.ThirdPartyLinks)
+	if entityCount == 0 {
+		return fmt.Errorf("init data contains no entities")
+	}
+
+	hasBuiltInOrganization := false
+	hasBuiltInApplication := false
+	hasSecureBuiltInAdmin := false
+	for _, organization := range data.Organizations {
+		if organization == nil || organization.Owner == "" || organization.Name == "" {
+			return fmt.Errorf("init data contains an invalid organization")
+		}
+		if organization.Owner == "admin" && organization.Name == "built-in" {
+			hasBuiltInOrganization = true
+		}
+	}
+	for _, application := range data.Applications {
+		if application == nil || application.Owner == "" || application.Name == "" {
+			return fmt.Errorf("init data contains an invalid application")
+		}
+		if err := ValidateOAuthGrantTypes(application.GrantTypes); err != nil {
+			return fmt.Errorf("application %s/%s: %w", application.Owner, application.Name, err)
+		}
+		if application.Owner == "admin" && application.Name == "app-built-in" && application.Organization == "built-in" {
+			hasBuiltInApplication = true
+		}
+	}
+	for _, user := range data.Users {
+		if user == nil || user.Owner == "" || user.Name == "" {
+			return fmt.Errorf("init data contains an invalid user")
+		}
+		if user.Owner == "built-in" && user.Name == "admin" {
+			password := strings.TrimSpace(user.Password)
+			hasSecureBuiltInAdmin = user.IsAdmin && !user.IsForbidden && !user.IsDeleted &&
+				password != "" && password != "123" && password != "***"
+		}
+	}
+
+	if requireSecureBootstrap {
+		if !hasBuiltInOrganization || !hasBuiltInApplication || !hasSecureBuiltInAdmin {
+			return fmt.Errorf("secure bootstrap requires built-in organization, app-built-in, and a non-default active built-in/admin credential")
+		}
+	}
+	return nil
+}
+
+func ensureInitDataImportTargetEmpty() error {
+	for _, target := range initDataImportTargets() {
+		count, err := ormer.Engine.Count(target.bean)
+		if err != nil {
+			return err
+		}
+		if count != 0 {
+			return fmt.Errorf("initDataNewOnly=false cannot import into a non-empty database: %s has %d records", target.name, count)
+		}
+	}
+	return nil
+}
+
+type initDataImportTarget struct {
+	name string
+	bean interface{}
+}
+
+func initDataImportTargets() []initDataImportTarget {
+	return []initDataImportTarget{
+		{name: "organizations", bean: new(Organization)},
+		{name: "applications", bean: new(Application)},
+		{name: "users", bean: new(User)},
+		{name: "certs", bean: new(Cert)},
+		{name: "providers", bean: new(Provider)},
+		{name: "ldaps", bean: new(Ldap)},
+		{name: "models", bean: new(Model)},
+		{name: "permissions", bean: new(Permission)},
+		{name: "payments", bean: new(Payment)},
+		{name: "products", bean: new(Product)},
+		{name: "resources", bean: new(Resource)},
+		{name: "roles", bean: new(Role)},
+		{name: "syncers", bean: new(Syncer)},
+		{name: "tokens", bean: new(Token)},
+		{name: "webhooks", bean: new(Webhook)},
+		{name: "groups", bean: new(Group)},
+		{name: "adapters", bean: new(Adapter)},
+		{name: "enforcers", bean: new(Enforcer)},
+		{name: "plans", bean: new(Plan)},
+		{name: "pricings", bean: new(Pricing)},
+		{name: "invitations", bean: new(Invitation)},
+		{name: "records", bean: new(Record)},
+		{name: "sessions", bean: new(Session)},
+		{name: "subscriptions", bean: new(Subscription)},
+		{name: "transactions", bean: new(Transaction)},
+		{name: "sites", bean: new(Site)},
+		{name: "rules", bean: new(Rule)},
+		{name: "third-party links", bean: new(ThirdPartyLink)},
 	}
 }
 

@@ -42,14 +42,24 @@ type webAuthnSigninSession struct {
 	Ceremony      webauthn.SessionData         `json:"ceremony"`
 	Request       *object.AuthorizationRequest `json:"request,omitempty"`
 	ResponseType  string                       `json:"response_type"`
+	ApplicationId string                       `json:"application_id"`
+	Organization  string                       `json:"organization"`
+	ClientId      string                       `json:"client_id"`
+	SigninMethod  string                       `json:"signin_method"`
 	TransactionId string                       `json:"transaction_id"`
 }
 
 var consumedWebAuthnSigninTransactions sync.Map
 
-func newWebAuthnSigninSession(sessionData webauthn.SessionData, responseType string, request *object.AuthorizationRequest) (webAuthnSigninSession, error) {
+func newWebAuthnSigninSession(sessionData webauthn.SessionData, responseType string, request *object.AuthorizationRequest, application *object.Application, clientId string, signinMethod string) (webAuthnSigninSession, error) {
 	if responseType == "" {
 		responseType = ResponseTypeLogin
+	}
+	if err := validateWebAuthnSigninApplication(application, signinMethod); err != nil {
+		return webAuthnSigninSession{}, err
+	}
+	if strings.TrimSpace(clientId) == "" || clientId != strings.TrimSpace(clientId) {
+		return webAuthnSigninSession{}, fmt.Errorf("WebAuthn client_id must be provided exactly")
 	}
 
 	var requestCopy *object.AuthorizationRequest
@@ -62,6 +72,10 @@ func newWebAuthnSigninSession(sessionData webauthn.SessionData, responseType str
 		Ceremony:      sessionData,
 		Request:       requestCopy,
 		ResponseType:  responseType,
+		ApplicationId: application.GetId(),
+		Organization:  application.Organization,
+		ClientId:      clientId,
+		SigninMethod:  signinMethod,
 		TransactionId: util.GenerateId(),
 	}
 	if err := session.validate(time.Now()); err != nil {
@@ -80,6 +94,18 @@ func (session webAuthnSigninSession) validate(now time.Time) error {
 	if session.Ceremony.Expires.IsZero() || !session.Ceremony.Expires.After(now) {
 		return fmt.Errorf("WebAuthn authentication challenge has expired")
 	}
+	if strings.TrimSpace(session.ApplicationId) == "" {
+		return fmt.Errorf("WebAuthn authentication application must not be empty")
+	}
+	if strings.TrimSpace(session.Organization) == "" {
+		return fmt.Errorf("WebAuthn authentication organization must not be empty")
+	}
+	if strings.TrimSpace(session.ClientId) == "" || session.ClientId != strings.TrimSpace(session.ClientId) {
+		return fmt.Errorf("WebAuthn authentication client_id is invalid")
+	}
+	if session.SigninMethod != "WebAuthn" {
+		return fmt.Errorf("WebAuthn authentication signin method is invalid")
+	}
 
 	switch session.ResponseType {
 	case ResponseTypeLogin, ResponseTypeToken, ResponseTypeIdToken, ResponseTypeSaml, ResponseTypeCas, ResponseTypeDevice:
@@ -95,6 +121,45 @@ func (session webAuthnSigninSession) validate(now time.Time) error {
 		}
 	default:
 		return fmt.Errorf("WebAuthn authentication response type %q is not supported", session.ResponseType)
+	}
+	return nil
+}
+
+func validateWebAuthnSigninApplication(application *object.Application, signinMethod string) error {
+	if application == nil {
+		return fmt.Errorf("WebAuthn application does not exist")
+	}
+	if signinMethod != "WebAuthn" {
+		return fmt.Errorf("WebAuthn signin method must be explicitly selected")
+	}
+	if !application.EnableWebAuthn || !application.HasSigninMethod("WebAuthn") {
+		return fmt.Errorf("WebAuthn is not enabled for the application")
+	}
+	return nil
+}
+
+func (session webAuthnSigninSession) matchesApplication(application *object.Application, clientId string, signinMethod string) error {
+	if err := validateWebAuthnSigninApplication(application, signinMethod); err != nil {
+		return err
+	}
+	if application.GetId() != session.ApplicationId {
+		return fmt.Errorf("WebAuthn application does not match the challenge")
+	}
+	if application.Organization != session.Organization || clientId != session.ClientId {
+		return fmt.Errorf("WebAuthn application tenant or client does not match the challenge")
+	}
+	if signinMethod != session.SigninMethod {
+		return fmt.Errorf("WebAuthn signin method does not match the challenge")
+	}
+	return nil
+}
+
+func validateWebAuthnUserApplication(application *object.Application, user *object.User) error {
+	if application == nil || user == nil {
+		return fmt.Errorf("WebAuthn application or user is missing")
+	}
+	if user.Owner != application.Organization {
+		return fmt.Errorf("WebAuthn user does not belong to the challenge application")
 	}
 	return nil
 }
@@ -116,6 +181,32 @@ func (session webAuthnSigninSession) matchesContinuation(responseType string, re
 		return fmt.Errorf("WebAuthn OAuth authorization request does not match the challenge")
 	}
 	return nil
+}
+
+func (c *ApiController) resolveWebAuthnSigninApplication(responseType string, authorizationRequest *object.AuthorizationRequest) (*object.Application, string, string, error) {
+	signinMethod := c.Ctx.Input.Query("signinMethod")
+	clientId := c.getQueryValue("clientId", "client_id")
+	if responseType == ResponseTypeCode {
+		if authorizationRequest == nil {
+			return nil, "", signinMethod, fmt.Errorf("WebAuthn code authentication requires an OAuth authorization request")
+		}
+		if clientId != "" && clientId != authorizationRequest.ClientId {
+			return nil, "", signinMethod, fmt.Errorf("WebAuthn client does not match the authorization request")
+		}
+		clientId = authorizationRequest.ClientId
+	}
+	if strings.TrimSpace(clientId) == "" || clientId != strings.TrimSpace(clientId) {
+		return nil, "", signinMethod, fmt.Errorf("WebAuthn client_id must be provided exactly")
+	}
+
+	application, err := object.GetApplicationByClientId(clientId)
+	if err != nil {
+		return nil, "", signinMethod, err
+	}
+	if err = validateWebAuthnSigninApplication(application, signinMethod); err != nil {
+		return nil, "", signinMethod, err
+	}
+	return application, clientId, signinMethod, nil
 }
 
 func claimWebAuthnSigninTransaction(transactionId string, expiresAt int64, now int64) bool {
@@ -256,12 +347,6 @@ func (c *ApiController) WebAuthnSignupFinish() {
 // @Success 200 {object} protocol.CredentialAssertion The CredentialAssertion object
 // @router /webauthn/signin/begin [get]
 func (c *ApiController) WebAuthnSigninBegin() {
-	webauthnObj, err := object.GetWebAuthnObject(c.Ctx.Request.Host)
-	if err != nil {
-		c.ResponseError(err.Error())
-		return
-	}
-
 	responseType := c.getQueryValue("responseType", "response_type")
 	if responseType == "" {
 		responseType = ResponseTypeLogin
@@ -274,6 +359,17 @@ func (c *ApiController) WebAuthnSigninBegin() {
 			return
 		}
 		authorizationRequest = &request
+	}
+	application, clientId, signinMethod, err := c.resolveWebAuthnSigninApplication(responseType, authorizationRequest)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+
+	webauthnObj, err := object.GetWebAuthnObject(c.Ctx.Request.Host)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
 	}
 
 	userOwner := c.Ctx.Input.Query("owner")
@@ -296,6 +392,10 @@ func (c *ApiController) WebAuthnSigninBegin() {
 			c.ResponseError(fmt.Sprintf(c.T("general:The user: %s doesn't exist"), util.GetId(userOwner, userName)))
 			return
 		}
+		if err = validateWebAuthnUserApplication(application, user); err != nil {
+			c.ResponseError(err.Error())
+			return
+		}
 		if len(user.WebauthnCredentials) == 0 {
 			c.ResponseError(c.T("webauthn:Found no credentials for this user"))
 			return
@@ -309,7 +409,7 @@ func (c *ApiController) WebAuthnSigninBegin() {
 		return
 	}
 
-	boundSession, err := newWebAuthnSigninSession(*sessionData, responseType, authorizationRequest)
+	boundSession, err := newWebAuthnSigninSession(*sessionData, responseType, authorizationRequest, application, clientId, signinMethod)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return
@@ -368,6 +468,15 @@ func (c *ApiController) WebAuthnSigninFinish() {
 		c.ResponseError(err.Error())
 		return
 	}
+	application, clientId, signinMethod, err := c.resolveWebAuthnSigninApplication(responseType, authorizationRequest)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if err = boundSession.matchesApplication(application, clientId, signinMethod); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 
 	webauthnObj, err := object.GetWebAuthnObject(c.Ctx.Request.Host)
 	if err != nil {
@@ -407,20 +516,8 @@ func (c *ApiController) WebAuthnSigninFinish() {
 		c.ResponseError("WebAuthn authenticated user is missing")
 		return
 	}
-
-	var application *object.Application
-
-	if authorizationRequest != nil {
-		application, err = object.GetApplicationByClientId(authorizationRequest.ClientId)
-	} else {
-		application, err = object.GetApplicationByUser(user)
-	}
-	if err != nil {
+	if err = validateWebAuthnUserApplication(application, user); err != nil {
 		c.ResponseError(err.Error())
-		return
-	}
-	if application == nil {
-		c.ResponseError(c.T("check:Application does not exist"))
 		return
 	}
 

@@ -206,7 +206,7 @@ func (c *ApiController) GetMcpAccessToken() {
 		c.ResponseError("fresh authentication is required before issuing an MCP access token")
 		return
 	}
-	token, err := object.GetTokenByUserWithAuthenticationContext(application, user, "read", "", c.Ctx.Request.Host, authenticationContext)
+	token, err := object.GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "read", "", c.Ctx.Request.Host, authenticationContext)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return

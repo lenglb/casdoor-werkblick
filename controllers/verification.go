@@ -536,14 +536,7 @@ func (c *ApiController) ResetEmailOrPhone() {
 	switch destType {
 	case object.VerifyTypeEmail:
 		id := user.GetId()
-		user.Email = dest
-		user.EmailVerified = true
-		columns := []string{"email", "email_verified"}
-		if organization.UseEmailAsUsername {
-			user.Name = user.Email
-			columns = append(columns, "name")
-		}
-		_, err = object.UpdateUser(id, user, columns, false)
+		user, err = object.UpdateUserEmailFromVerifiedChallenge(id, dest, organization.UseEmailAsUsername)
 	case object.VerifyTypePhone:
 		user.Phone = dest
 		_, err = object.SetUserField(user, "phone", user.Phone)

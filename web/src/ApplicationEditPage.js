@@ -64,6 +64,7 @@ import TokenAttributeTable from "./table/TokenAttributeTable";
 import {Content, Header} from "antd/es/layout/layout";
 import Sider from "antd/es/layout/Sider";
 import PaginateSelect from "./common/PaginateSelect";
+import {normalizeApplicationGrantTypes, normalizeApplicationScopes} from "./ApplicationSecurityDefaults.mjs";
 
 const {Option} = Select;
 
@@ -177,9 +178,8 @@ class ApplicationEditPage extends React.Component {
         }
 
         const application = res.data;
-        if (application.grantTypes === null || application.grantTypes === undefined || application.grantTypes.length === 0) {
-          application.grantTypes = ["authorization_code"];
-        }
+        application.grantTypes = normalizeApplicationGrantTypes(application.grantTypes);
+        application.scopes = normalizeApplicationScopes(application.scopes);
 
         if (application.tags === null || application.tags === undefined) {
           application.tags = [];
@@ -193,7 +193,9 @@ class ApplicationEditPage extends React.Component {
 
         this.getCerts(application);
 
-        this.getSamlMetadata(application.enableSamlPostBinding);
+        if (application.enableSaml) {
+          this.getSamlMetadata(application.enableSamlPostBinding, application);
+        }
       });
   }
 
@@ -242,7 +244,13 @@ class ApplicationEditPage extends React.Component {
       });
   }
 
-  getSamlMetadata(checked) {
+  getSamlMetadata(checked, application = this.state.application) {
+    if (!application?.enableSaml) {
+      this.setState({
+        samlMetadata: null,
+      });
+      return;
+    }
     ApplicationBackend.getSamlMetadata("admin", this.state.applicationName, checked)
       .then((data) => {
         this.setState({
@@ -793,22 +801,18 @@ class ApplicationEditPage extends React.Component {
               </Select>
             </Col>
           </Row>
-          {
-            (this.state.application.category === "Agent") ? (
-              <Row style={{marginTop: "20px"}} >
-                <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
-                  {Setting.getLabel(i18next.t("general:Scopes"), i18next.t("general:Scopes - Tooltip"))} :
-                </Col>
-                <Col span={21} >
-                  <ScopeTable
-                    title={i18next.t("general:Scopes")}
-                    table={this.state.application.scopes}
-                    onUpdateTable={(value) => {this.updateApplicationField("scopes", value);}}
-                  />
-                </Col>
-              </Row>
-            ) : null
-          }
+          <Row style={{marginTop: "20px"}} >
+            <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
+              {Setting.getLabel(i18next.t("general:Scopes"), i18next.t("general:Scopes - Tooltip"))} :
+            </Col>
+            <Col span={21} >
+              <ScopeTable
+                title={i18next.t("general:Scopes")}
+                table={this.state.application.scopes}
+                onUpdateTable={(value) => {this.updateApplicationField("scopes", value);}}
+              />
+            </Col>
+          </Row>
           <Row style={{marginTop: "20px"}} >
             <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
               {Setting.getLabel(i18next.t("general:Custom scopes"), i18next.t("general:Custom scopes - Tooltip"))} :
@@ -912,11 +916,24 @@ class ApplicationEditPage extends React.Component {
       {this.state.activeMenuKey === "saml" && (
         <React.Fragment>
           <Row style={{marginTop: "10px"}} >
+            <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 19 : 2}>
+              {Setting.getLabel(i18next.t("application:Enable SAML identity provider"), i18next.t("application:Enable SAML identity provider - Tooltip"))} :
+            </Col>
+            <Col span={1} >
+              <Switch checked={this.state.application.enableSaml} onChange={checked => {
+                this.updateApplicationField("enableSaml", checked);
+                if (!checked) {
+                  this.setState({samlMetadata: null});
+                }
+              }} />
+            </Col>
+          </Row>
+          <Row style={{marginTop: "10px"}} >
             <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
               {Setting.getLabel(i18next.t("application:SAML reply URL"), i18next.t("application:Redirect URL (Assertion Consumer Service POST Binding URL) - Tooltip"))} :
             </Col>
             <Col span={21} >
-              <Input prefix={<LinkOutlined />} value={this.state.application.samlReplyUrl} onChange={e => {
+              <Input disabled={!this.state.application.enableSaml} prefix={<LinkOutlined />} value={this.state.application.samlReplyUrl} onChange={e => {
                 this.updateApplicationField("samlReplyUrl", e.target.value);
               }} />
             </Col>
@@ -1048,7 +1065,7 @@ class ApplicationEditPage extends React.Component {
             <Col span={21}>
               <Editor value={this.state.samlMetadata?.toString() ?? ""} lang="xml" readOnly />
               <br />
-              <Button style={{marginBottom: "10px"}} type="primary" shape="round" icon={<CopyOutlined />} onClick={() => {
+              <Button disabled={!this.state.application.enableSaml} style={{marginBottom: "10px"}} type="primary" shape="round" icon={<CopyOutlined />} onClick={() => {
                 copy(`${window.location.origin}/api/saml/metadata?application=admin/${encodeURIComponent(this.state.applicationName)}&enablePostBinding=${this.state.application.enableSamlPostBinding}`);
                 Setting.showMessage("success", i18next.t("general:Copied to clipboard successfully"));
               }}

@@ -158,6 +158,7 @@ func (c *ApiController) DeleteToken() {
 // @Param   client_id     query    string  true        "OAuth client id"
 // @Param   client_secret     query    string  true        "OAuth client secret"
 // @Param   code     query    string  true        "OAuth code"
+// @Param   redirect_uri     query    string  true        "Exact redirect URI from the authorization request"
 // @Success 200 {object} object.TokenWrapper The Response object
 // @Success 400 {object} object.TokenError The Response object
 // @Success 401 {object} object.TokenError The Response object
@@ -173,6 +174,7 @@ func (c *ApiController) GetOAuthToken() {
 	grantType := c.Ctx.Input.Query("grant_type")
 	code := c.Ctx.Input.Query("code")
 	verifier := c.Ctx.Input.Query("code_verifier")
+	redirectUri := c.Ctx.Input.Query("redirect_uri")
 	scope := c.Ctx.Input.Query("scope")
 	nonce := c.Ctx.Input.Query("nonce")
 	username := c.Ctx.Input.Query("username")
@@ -215,6 +217,9 @@ func (c *ApiController) GetOAuthToken() {
 			}
 			if verifier == "" {
 				verifier = tokenRequest.Verifier
+			}
+			if redirectUri == "" {
+				redirectUri = tokenRequest.RedirectUri
 			}
 			if scope == "" {
 				scope = tokenRequest.Scope
@@ -285,7 +290,7 @@ func (c *ApiController) GetOAuthToken() {
 	}
 	clientId = clientAuthentication.ClientId
 	clientSecret = clientAuthentication.ClientSecret
-	token, err := object.GetOAuthToken(grantType, clientId, clientSecret, code, verifier, scope, nonce, username, password, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, deviceCode, dpopProof, clientAuthentication)
+	token, err := object.GetOAuthTokenWithRedirectUri(grantType, clientId, clientSecret, code, verifier, redirectUri, scope, nonce, username, password, host, refreshToken, tag, avatar, c.GetAcceptLanguage(), subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, deviceCode, dpopProof, clientAuthentication)
 	if err != nil {
 		c.ResponseError(err.Error())
 		return

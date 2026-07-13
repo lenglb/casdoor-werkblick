@@ -50,9 +50,22 @@ func validWebAuthnSessionData() webauthn.SessionData {
 	}
 }
 
+func validWebAuthnApplication() *object.Application {
+	return &object.Application{
+		Owner:          "admin",
+		Name:           "app",
+		Organization:   "tenant",
+		ClientId:       "client-id",
+		EnableWebAuthn: true,
+		SigninMethods: []*object.SigninMethod{
+			{Name: "WebAuthn", Rule: "None"},
+		},
+	}
+}
+
 func TestNewWebAuthnSigninSessionBindsAuthorizationRequestWithoutAliasing(t *testing.T) {
 	request := validWebAuthnAuthorizationRequest()
-	session, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, &request)
+	session, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, &request, validWebAuthnApplication(), "client-id", "WebAuthn")
 	if err != nil {
 		t.Fatalf("newWebAuthnSigninSession() error = %v", err)
 	}
@@ -78,20 +91,20 @@ func TestNewWebAuthnSigninSessionBindsAuthorizationRequestWithoutAliasing(t *tes
 }
 
 func TestWebAuthnSigninSessionValidationRequiresBoundCodeRequest(t *testing.T) {
-	_, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, nil)
+	_, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, nil, validWebAuthnApplication(), "client-id", "WebAuthn")
 	if err == nil || !strings.Contains(err.Error(), "requires an OAuth authorization request") {
 		t.Fatalf("newWebAuthnSigninSession() error = %v, want missing request error", err)
 	}
 
 	request := validWebAuthnAuthorizationRequest()
-	_, err = newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeLogin, &request)
+	_, err = newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeLogin, &request, validWebAuthnApplication(), "client-id", "WebAuthn")
 	if err == nil || !strings.Contains(err.Error(), "non-code") {
 		t.Fatalf("newWebAuthnSigninSession() error = %v, want non-code request error", err)
 	}
 
 	expired := validWebAuthnSessionData()
 	expired.Expires = time.Now().Add(-time.Second)
-	_, err = newWebAuthnSigninSession(expired, ResponseTypeLogin, nil)
+	_, err = newWebAuthnSigninSession(expired, ResponseTypeLogin, nil, validWebAuthnApplication(), "client-id", "WebAuthn")
 	if err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("newWebAuthnSigninSession() error = %v, want expiry error", err)
 	}
@@ -99,7 +112,7 @@ func TestWebAuthnSigninSessionValidationRequiresBoundCodeRequest(t *testing.T) {
 
 func TestWebAuthnSigninSessionMatchesExactContinuation(t *testing.T) {
 	request := validWebAuthnAuthorizationRequest()
-	session, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, &request)
+	session, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeCode, &request, validWebAuthnApplication(), "client-id", "WebAuthn")
 	if err != nil {
 		t.Fatalf("newWebAuthnSigninSession() error = %v", err)
 	}
@@ -133,6 +146,66 @@ func TestWebAuthnSigninSessionMatchesExactContinuation(t *testing.T) {
 				t.Fatal("matchesContinuation() accepted a changed authorization request")
 			}
 		})
+	}
+}
+
+func TestWebAuthnSigninApplicationRequiresBothExplicitGates(t *testing.T) {
+	application := validWebAuthnApplication()
+	if err := validateWebAuthnSigninApplication(application, "WebAuthn"); err != nil {
+		t.Fatalf("valid WebAuthn application rejected: %v", err)
+	}
+
+	application.EnableWebAuthn = false
+	if err := validateWebAuthnSigninApplication(application, "WebAuthn"); err == nil {
+		t.Fatal("application with enableWebAuthn=false unexpectedly accepted")
+	}
+	application.EnableWebAuthn = true
+	application.SigninMethods = []*object.SigninMethod{{Name: "Password", Rule: "Non-LDAP"}}
+	if err := validateWebAuthnSigninApplication(application, "WebAuthn"); err == nil {
+		t.Fatal("application without WebAuthn signin method unexpectedly accepted")
+	}
+	application.SigninMethods = []*object.SigninMethod{{Name: "WebAuthn", Rule: "None"}}
+	for _, method := range []string{"", "webauthn", "Password", " WebAuthn"} {
+		if err := validateWebAuthnSigninApplication(application, method); err == nil {
+			t.Fatalf("signin method %q unexpectedly accepted", method)
+		}
+	}
+}
+
+func TestWebAuthnSigninSessionRejectsApplicationSwap(t *testing.T) {
+	application := validWebAuthnApplication()
+	session, err := newWebAuthnSigninSession(validWebAuthnSessionData(), ResponseTypeLogin, nil, application, "client-id", "WebAuthn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = session.matchesApplication(application, "client-id", "WebAuthn"); err != nil {
+		t.Fatalf("bound application rejected: %v", err)
+	}
+
+	otherApplication := *application
+	otherApplication.Name = "other-app"
+	otherApplication.ClientId = "other-client"
+	if err = session.matchesApplication(&otherApplication, "other-client", "WebAuthn"); err == nil {
+		t.Fatal("transaction application swap unexpectedly accepted")
+	}
+
+	disabledApplication := *application
+	disabledApplication.EnableWebAuthn = false
+	if err = session.matchesApplication(&disabledApplication, "client-id", "WebAuthn"); err == nil {
+		t.Fatal("application disabled between begin and finish unexpectedly accepted")
+	}
+	if err = session.matchesApplication(application, "client-id-org-other-tenant", "WebAuthn"); err == nil {
+		t.Fatal("client or shared-tenant swap unexpectedly accepted")
+	}
+}
+
+func TestWebAuthnUserMustBelongToBoundApplication(t *testing.T) {
+	application := validWebAuthnApplication()
+	if err := validateWebAuthnUserApplication(application, &object.User{Owner: application.Organization}); err != nil {
+		t.Fatalf("tenant-bound user rejected: %v", err)
+	}
+	if err := validateWebAuthnUserApplication(application, &object.User{Owner: "other-tenant"}); err == nil {
+		t.Fatal("user from another tenant unexpectedly accepted")
 	}
 }
 

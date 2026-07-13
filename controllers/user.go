@@ -258,6 +258,7 @@ func (c *ApiController) GetUser() {
 // @Param   id     query    string  false        "The id ( owner/name ) of the user"
 // @Param   userId query    string  false        "The userId (UUID) of the user"
 // @Param   owner  query    string  false        "The owner of the user (required when using userId)"
+// @Param   columns query   string  false        "Optional comma-separated role-specific allowlist of fields to update; unknown or sensitive fields are rejected"
 // @Param   body    body   object.User  true        "The details of the user"
 // @Success 200 {object} controllers.Response The Response object
 // @router /update-user [post]
@@ -267,12 +268,7 @@ func (c *ApiController) UpdateUser() {
 	owner := c.Ctx.Input.Query("owner")
 	columnsStr := c.Ctx.Input.Query("columns")
 
-	var user object.User
-	err := json.Unmarshal(c.Ctx.Input.RequestBody, &user)
-	if err != nil {
-		c.ResponseError(err.Error())
-		return
-	}
+	var err error
 
 	if id == "" && userId == "" {
 		id = c.GetSessionUsername()
@@ -313,13 +309,24 @@ func (c *ApiController) UpdateUser() {
 		return
 	}
 
-	if columnsStr != "" {
-		mergedUser := *oldUser
-		if err = json.Unmarshal(c.Ctx.Input.RequestBody, &mergedUser); err != nil {
-			c.ResponseError(err.Error())
+	isAdmin := c.IsAdmin()
+	if !c.IsGlobalAdmin() {
+		requestUser := c.getCurrentUser()
+		if requestUser == nil || requestUser.Owner != oldUser.Owner || (!requestUser.IsAdmin && requestUser.Name != oldUser.Name) {
+			c.ResponseError(c.T("auth:Unauthorized operation"))
 			return
 		}
-		user = mergedUser
+	}
+
+	fields, explicitColumns, err := resolveUserUpdateFields(columnsStr, isAdmin)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	user, err := buildUserUpdateCandidate(oldUser, c.Ctx.Input.RequestBody, fields, explicitColumns)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
 	}
 
 	if oldUser.Owner == "built-in" && oldUser.Name == "admin" && (user.Owner != "built-in" || user.Name != "admin") {
@@ -356,19 +363,17 @@ func (c *ApiController) UpdateUser() {
 		user.Name = strings.ToLower(user.Name)
 	}
 
-	isAdmin := c.IsAdmin()
+	if err = validateUserUpdateFieldPermissions(oldUser, &user, fields, isAdmin, c.GetAcceptLanguage()); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 	allowDisplayNameEmpty := c.Ctx.Input.Query("allowEmpty") != ""
 	if pass, err := object.CheckPermissionForUpdateUser(oldUser, &user, isAdmin, allowDisplayNameEmpty, c.GetAcceptLanguage()); !pass {
 		c.ResponseError(err)
 		return
 	}
 
-	columns := []string{}
-	if columnsStr != "" {
-		for _, col := range strings.Split(columnsStr, ",") {
-			columns = append(columns, util.CamelToSnakeCase(col))
-		}
-	}
+	columns := userUpdateColumns(fields)
 
 	affected, err := object.UpdateUser(id, &user, columns, isAdmin)
 	if err != nil {

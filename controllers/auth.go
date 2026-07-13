@@ -247,6 +247,10 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 		} else {
 			scope := c.Ctx.Input.Query("scope")
 			nonce := c.Ctx.Input.Query("nonce")
+			if nonceError := object.ValidateOAuthNonceForGrant(form.Type, nonce); nonceError != nil {
+				resp = &Response{Status: "error", Msg: nonceError.ErrorDescription, Data: ""}
+				return
+			}
 			expandedScope, valid := object.IsScopeValidAndExpand(scope, application)
 			if !valid {
 				resp = &Response{Status: "error", Msg: "error: invalid_scope", Data: ""}
@@ -256,7 +260,7 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 					resp = &Response{Status: "error", Msg: "error: verified authentication context is required", Data: ""}
 					return
 				}
-				token, tokenErr := object.GetTokenByUserWithAuthenticationContext(application, user, expandedScope, nonce, c.Ctx.Request.Host, authenticationContext)
+				token, tokenErr := object.GetTokenByUserForGrantWithAuthenticationContext(application, user, form.Type, expandedScope, nonce, c.Ctx.Request.Host, authenticationContext)
 				if tokenErr != nil {
 					resp = &Response{Status: "error", Msg: tokenErr.Error(), Data: ""}
 					return
@@ -701,6 +705,40 @@ func linkUserByProvider(user *object.User, provider *object.Provider, providerId
 	return object.LinkUserAccount(user, provider.Type, providerId)
 }
 
+func resolvePasswordSigninMethod(application *object.Application, signinMethod string) (isSigninViaLdap bool, isPasswordWithLdapEnabled bool, err error) {
+	if application == nil {
+		return false, false, fmt.Errorf("application is missing")
+	}
+
+	switch signinMethod {
+	case "":
+		// Older Casdoor clients omit the selector for local password login. Keep
+		// that wire format compatible, but still require password authentication
+		// to be enabled explicitly. Unlike "Password", the legacy path must not
+		// silently add LDAP fallback; this preserves the pre-hardening behavior.
+		if !application.IsPasswordEnabled() {
+			return false, false, fmt.Errorf("the login method: login with password is not enabled for the application")
+		}
+		return false, false, nil
+	case "Password":
+		if !application.IsPasswordEnabled() {
+			return false, false, fmt.Errorf("the login method: login with password is not enabled for the application")
+		}
+		return false, application.IsPasswordWithLdapEnabled(), nil
+	case "LDAP":
+		if !application.IsLdapEnabled() {
+			return false, false, fmt.Errorf("the login method: login with LDAP is not enabled for the application")
+		}
+		return true, false, nil
+	default:
+		// A non-empty password is a credential, not a method selector. Requiring
+		// an exact known method prevents unknown values (notably from
+		// machine-to-machine clients) from falling through to local password
+		// verification.
+		return false, false, fmt.Errorf("the login method is invalid for password authentication")
+	}
+}
+
 // Login ...
 // @Title Login
 // @Tag Login API
@@ -879,12 +917,9 @@ func (c *ApiController) Login() {
 				c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), authForm.Application))
 				return
 			}
-			if authForm.SigninMethod == "Password" && !application.IsPasswordEnabled() {
-				c.ResponseError(c.T("auth:The login method: login with password is not enabled for the application"))
-				return
-			}
-			if authForm.SigninMethod == "LDAP" && !application.IsLdapEnabled() {
-				c.ResponseError(c.T("auth:The login method: login with LDAP is not enabled for the application"))
+			isSigninViaLdap, isPasswordWithLdapEnabled, methodErr := resolvePasswordSigninMethod(application, authForm.SigninMethod)
+			if methodErr != nil {
+				c.ResponseError(c.T(methodErr.Error()))
 				return
 			}
 
@@ -926,14 +961,6 @@ func (c *ApiController) Login() {
 					c.ResponseError(err.Error())
 					return
 				}
-			}
-
-			isSigninViaLdap := authForm.SigninMethod == "LDAP"
-			var isPasswordWithLdapEnabled bool
-			if authForm.SigninMethod == "Password" {
-				isPasswordWithLdapEnabled = application.IsPasswordWithLdapEnabled()
-			} else {
-				isPasswordWithLdapEnabled = false
 			}
 
 			if application.IsShared {
@@ -1834,6 +1861,13 @@ func (c *ApiController) DeviceAuth() {
 		c.ServeJSON()
 		return
 	}
+	expandedScope, deviceAuthError := object.ValidateDeviceAuthorizationRequest(application, scope)
+	if deviceAuthError != nil {
+		c.Data["json"] = deviceAuthError
+		c.ServeJSON()
+		return
+	}
+	scope = expandedScope
 
 	deviceCode := util.GenerateId()
 	userCode := util.GetRandomName()

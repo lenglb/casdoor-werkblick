@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func setupTokenAccessTestOrmer(t *testing.T) {
@@ -41,6 +42,94 @@ func setupTokenAccessTestOrmer(t *testing.T) {
 		ormer = previousOrmer
 		testOrmer.close()
 	})
+}
+
+func TestSessionBoundUserTokenMintRequiresGrantScopeAndActiveUser(t *testing.T) {
+	context := AuthenticationContext{Subject: "tenant/alice", AuthTime: time.Now().Unix(), Amr: []string{"pwd"}}
+	user := &User{Owner: "tenant", Name: "alice", Id: "user-1"}
+	application := &Application{Owner: "admin", Name: "app", Organization: "tenant"}
+
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "not enabled") {
+		t.Fatalf("missing grant error = %v", err)
+	}
+	application.GrantTypes = []string{"authorization_code"}
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "scope") {
+		t.Fatalf("missing scope error = %v", err)
+	}
+
+	setupTokenAccessTestOrmer(t)
+	user.IsForbidden = true
+	organization := &Organization{Owner: "admin", Name: "tenant"}
+	insertTokenAccessFixtures(t, user, organization)
+	application.Scopes = []*ScopeItem{{Name: "profile"}}
+	if _, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, "authorization_code", "profile", "", "", context); err == nil || !strings.Contains(err.Error(), "forbidden") {
+		t.Fatalf("forbidden user mint error = %v", err)
+	}
+}
+
+func TestLegacyUserTokenMintWithoutExplicitGrantFailsClosed(t *testing.T) {
+	context := AuthenticationContext{Subject: "tenant/alice", AuthTime: time.Now().Unix(), Amr: []string{"pwd"}}
+	application := &Application{Owner: "admin", Name: "app", GrantTypes: []string{"token"}}
+	user := &User{Owner: "tenant", Name: "alice", Id: "user-1"}
+
+	if _, err := GetTokenByUserWithAuthenticationContext(application, user, "", "", "", context); err == nil || !strings.Contains(err.Error(), "explicit OAuth grant") {
+		t.Fatalf("legacy context mint error = %v, want explicit grant rejection", err)
+	}
+}
+
+func TestHumanTokenPolicyRequiresAAL2OnlyWhenMfaIsEnabled(t *testing.T) {
+	now := time.Now().Unix()
+	tests := []struct {
+		name    string
+		user    *User
+		scope   string
+		context AuthenticationContext
+		want    string
+	}{
+		{
+			name:    "non-MFA password remains AAL1-compatible",
+			user:    &User{Owner: "tenant", Name: "alice", Id: "user-1"},
+			context: AuthenticationContext{Subject: "tenant/alice", AuthTime: now, Amr: []string{"pwd"}},
+		},
+		{
+			name:    "MFA password grant cannot bypass second factor",
+			user:    &User{Owner: "tenant", Name: "alice", Id: "user-1", TotpSecret: "enrolled"},
+			context: AuthenticationContext{Subject: "tenant/alice", AuthTime: now, Amr: []string{"pwd"}},
+			want:    "multi-factor authentication",
+		},
+		{
+			name:    "MFA JWT assertion cannot bypass second factor",
+			user:    &User{Owner: "tenant", Name: "alice", Id: "user-1", TotpSecret: "enrolled"},
+			context: AuthenticationContext{Subject: "tenant/alice", AuthTime: now, Amr: []string{"jwt"}},
+			want:    "multi-factor authentication",
+		},
+		{
+			name:    "server-bound AAL2 satisfies MFA",
+			user:    &User{Owner: "tenant", Name: "alice", Id: "user-1", TotpSecret: "enrolled"},
+			context: AuthenticationContext{Subject: "tenant/alice", AuthTime: now, Amr: []string{"pwd", "otp"}},
+		},
+		{
+			name:    "ordinary OIDC user may expose truthful unverified claim",
+			user:    &User{Owner: "tenant", Name: "alice", Id: "user-1", Email: "alice@example.test", EmailVerified: false},
+			scope:   "openid email",
+			context: AuthenticationContext{Subject: "tenant/alice", AuthTime: now, Amr: []string{"pwd"}},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tokenError := validateUserTokenAuthenticationPolicy(test.user, test.scope, test.context)
+			if test.want == "" {
+				if tokenError != nil {
+					t.Fatalf("policy rejected valid context: %#v", tokenError)
+				}
+				return
+			}
+			if tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, test.want) {
+				t.Fatalf("policy error = %#v, want invalid_grant containing %q", tokenError, test.want)
+			}
+		})
+	}
 }
 
 func insertTokenAccessFixtures(t *testing.T, user *User, organization *Organization) {
@@ -114,6 +203,12 @@ func TestTokenIssuanceAccessRejectsOffboardedAndRecreatedUsers(t *testing.T) {
 			previouslyLoadedUser: &User{Owner: "tenant", Name: "alice", Id: "original-user"},
 			wantDescription:      "no longer identifies",
 		},
+		{
+			name:                 "missing immutable ID",
+			persistedUser:        &User{Owner: "tenant", Name: "alice"},
+			previouslyLoadedUser: &User{Owner: "tenant", Name: "alice"},
+			wantDescription:      "immutable subject ID",
+		},
 	}
 
 	for _, test := range tests {
@@ -155,6 +250,13 @@ func TestTokenIssuanceAccessRejectsDisabledApplicationOrganizationAndTag(t *test
 			organization:    &Organization{Owner: "admin", Name: "tenant"},
 			user:            &User{Owner: "tenant", Name: "alice", Id: "user-1", Tag: "contractor"},
 			wantDescription: "tag",
+		},
+		{
+			name:            "required MFA enrollment incomplete",
+			application:     &Application{Owner: "admin", Name: "app", Organization: "tenant"},
+			organization:    &Organization{Owner: "admin", Name: "tenant", MfaItems: []*MfaItem{{Name: TotpType, Rule: "Required"}}},
+			user:            &User{Owner: "tenant", Name: "alice", Id: "user-1"},
+			wantDescription: "required MFA enrollment",
 		},
 	}
 

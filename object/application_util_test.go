@@ -77,3 +77,26 @@ func TestRedirectUriMatchesPattern(t *testing.T) {
 		}
 	}
 }
+
+func TestApplicationSigninMethodChecksIgnoreNilEntries(t *testing.T) {
+	application := &Application{
+		SigninMethods: []*SigninMethod{
+			nil,
+			{Name: "Password", Rule: "All"},
+			{Name: "LDAP"},
+		},
+	}
+
+	if !application.IsPasswordWithLdapEnabled() {
+		t.Fatal("nil sign-in method hid enabled password-with-LDAP method")
+	}
+	if !application.IsLdapEnabled() {
+		t.Fatal("nil sign-in method hid enabled LDAP method")
+	}
+
+	application.SigninMethods = []*SigninMethod{nil}
+	if application.IsPasswordWithLdapEnabled() || application.IsLdapEnabled() ||
+		application.IsCodeSigninViaEmailEnabled() || application.IsCodeSigninViaSmsEnabled() || application.IsFaceIdEnabled() {
+		t.Fatal("nil-only sign-in methods unexpectedly enabled authentication")
+	}
+}

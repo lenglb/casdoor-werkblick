@@ -16,6 +16,7 @@ package object
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/casdoor/casdoor/util"
@@ -65,6 +66,88 @@ type DcrError struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
+const maxDynamicClientScopeTokenLength = 128
+
+// normalizeDynamicClientScopes accepts only canonical, literal OAuth scope
+// tokens. DCR clients cannot introduce regex patterns into an application's
+// allowlist, and the normalized response always mirrors the stored contract.
+func normalizeDynamicClientScopes(scope string) ([]*ScopeItem, string, error) {
+	if scope == "" {
+		return []*ScopeItem{}, "", nil
+	}
+	if strings.TrimSpace(scope) != scope || strings.ContainsAny(scope, "\t\r\n") {
+		return nil, "", fmt.Errorf("scope must be a single-space-separated list of tokens")
+	}
+
+	tokens := strings.Split(scope, " ")
+	items := make([]*ScopeItem, 0, len(tokens))
+	normalized := make([]string, 0, len(tokens))
+	seen := make(map[string]struct{}, len(tokens))
+	for _, token := range tokens {
+		if !isSafeDynamicClientScopeToken(token) {
+			return nil, "", fmt.Errorf("scope token %q is empty, unsafe, or not a literal", token)
+		}
+		if _, ok := seen[token]; ok {
+			continue
+		}
+		seen[token] = struct{}{}
+		items = append(items, &ScopeItem{Name: token})
+		normalized = append(normalized, token)
+	}
+	return items, strings.Join(normalized, " "), nil
+}
+
+func isSafeDynamicClientScopeToken(token string) bool {
+	if token == "" || len(token) > maxDynamicClientScopeTokenLength {
+		return false
+	}
+	for _, character := range token {
+		if character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9' {
+			continue
+		}
+		switch character {
+		case '_', ':', '/', '-':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func dynamicClientScopeString(scopes []*ScopeItem) string {
+	names := make([]string, 0, len(scopes))
+	for _, scope := range scopes {
+		if scope != nil && scope.Name != "" {
+			names = append(names, scope.Name)
+		}
+	}
+	return strings.Join(names, " ")
+}
+
+func validateDynamicClientOAuthMetadata(grantTypes []string, responseTypes []string) error {
+	if err := ValidateOAuthGrantTypes(grantTypes); err != nil {
+		return err
+	}
+	seen := make(map[string]struct{}, len(responseTypes))
+	for _, responseType := range responseTypes {
+		grantType, ok := requiredGrantForOAuthResponseType(responseType)
+		if !ok {
+			return fmt.Errorf("unsupported OAuth response type: %q", responseType)
+		}
+		if _, exists := seen[responseType]; exists {
+			return fmt.Errorf("OAuth response type is duplicated: %q", responseType)
+		}
+		seen[responseType] = struct{}{}
+		if !IsGrantTypeValid(grantType, grantTypes) {
+			return fmt.Errorf("OAuth response type %q requires grant type %q", responseType, grantType)
+		}
+	}
+	return nil
+}
+
 // RegisterDynamicClient creates a new application based on DCR request (RFC 7591)
 func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization string, registrationClientUri string) (*DynamicClientRegistrationResponse, *DcrError, error) {
 	// Validate organization exists and has DCR enabled
@@ -94,6 +177,20 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 			ErrorDescription: "redirect_uris is required and must contain at least one URI",
 		}, nil
 	}
+	scopeItems, normalizedScope, scopeErr := normalizeDynamicClientScopes(req.Scope)
+	if scopeErr != nil {
+		return nil, &DcrError{
+			Error:            "invalid_client_metadata",
+			ErrorDescription: scopeErr.Error(),
+		}, nil
+	}
+	req.Scope = normalizedScope
+	if metadataErr := validateDynamicClientOAuthMetadata(req.GrantTypes, req.ResponseTypes); metadataErr != nil {
+		return nil, &DcrError{
+			Error:            "invalid_client_metadata",
+			ErrorDescription: metadataErr.Error(),
+		}, nil
+	}
 
 	// Set defaults
 	if req.ClientName == "" {
@@ -102,12 +199,6 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 			clientIdPrefix = clientIdPrefix[:8]
 		}
 		req.ClientName = fmt.Sprintf("DCR Client %s", clientIdPrefix)
-	}
-	if len(req.GrantTypes) == 0 {
-		req.GrantTypes = []string{"authorization_code"}
-	}
-	if len(req.ResponseTypes) == 0 {
-		req.ResponseTypes = []string{"code"}
 	}
 	if req.TokenEndpointAuthMethod == "" {
 		req.TokenEndpointAuthMethod = "client_secret_basic"
@@ -168,7 +259,7 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 		DisplayName:             req.ClientName,
 		Category:                "Agent",
 		Type:                    "MCP",
-		Scopes:                  []*ScopeItem{},
+		Scopes:                  scopeItems,
 		Logo:                    firstNonEmpty(req.LogoUri, inheritedLogo),
 		ThemeData:               inheritedThemeData,
 		FooterHtml:              inheritedFooterHtml,
@@ -228,7 +319,7 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 		ClientUri:               req.ClientUri,
 		PolicyUri:               req.PolicyUri,
 		TosUri:                  req.TosUri,
-		Scope:                   req.Scope,
+		Scope:                   dynamicClientScopeString(application.Scopes),
 		RegistrationClientUri:   fmt.Sprintf("%s/%s", registrationClientUri, clientId),
 		RegistrationAccessToken: registrationAccessToken,
 	}
@@ -266,6 +357,7 @@ func GetDynamicClientRegistrationResponse(app *Application, registrationClientUr
 		LogoUri:                 app.Logo,
 		ClientUri:               app.HomepageUrl,
 		TosUri:                  app.TermsOfUse,
+		Scope:                   dynamicClientScopeString(app.Scopes),
 		RegistrationClientUri:   fmt.Sprintf("%s/%s", registrationClientUri, app.ClientId),
 		RegistrationAccessToken: app.RegistrationAccessToken,
 	}
@@ -278,6 +370,21 @@ func UpdateDynamicClient(app *Application, req *DynamicClientRegistrationRequest
 			Error:            "invalid_redirect_uri",
 			ErrorDescription: "redirect_uris is required and must contain at least one URI",
 		}, nil
+	}
+	scopeItems, _, scopeErr := normalizeDynamicClientScopes(req.Scope)
+	if scopeErr != nil {
+		return nil, &DcrError{Error: "invalid_client_metadata", ErrorDescription: scopeErr.Error()}, nil
+	}
+	effectiveGrantTypes := app.GrantTypes
+	if req.GrantTypes != nil {
+		effectiveGrantTypes = req.GrantTypes
+	}
+	responseTypes := req.ResponseTypes
+	if responseTypes == nil {
+		responseTypes = []string{}
+	}
+	if metadataErr := validateDynamicClientOAuthMetadata(effectiveGrantTypes, responseTypes); metadataErr != nil {
+		return nil, &DcrError{Error: "invalid_client_metadata", ErrorDescription: metadataErr.Error()}, nil
 	}
 	if req.TokenEndpointAuthMethod != "" {
 		switch req.TokenEndpointAuthMethod {
@@ -295,8 +402,9 @@ func UpdateDynamicClient(app *Application, req *DynamicClientRegistrationRequest
 
 	app.DisplayName = firstNonEmpty(req.ClientName, app.DisplayName)
 	app.RedirectUris = req.RedirectUris
-	if len(req.GrantTypes) > 0 {
-		app.GrantTypes = req.GrantTypes
+	app.Scopes = scopeItems
+	if req.GrantTypes != nil {
+		app.GrantTypes = append([]string{}, req.GrantTypes...)
 	}
 	if req.LogoUri != "" {
 		app.Logo = req.LogoUri

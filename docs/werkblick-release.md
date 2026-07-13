@@ -11,8 +11,11 @@ is published.
 2. Require the complete **Werkblick CI** workflow before changes can merge.
 3. Add a tag ruleset covering `werkblick-v*`. Restrict tag creation and deletion
    to the release maintainers. The release job refuses unprotected tags.
-4. Create the `ghcr-production` environment with a required reviewer and block
-   self-review.
+4. Create the `ghcr-production` environment with a required reviewer. In a
+   multi-operator team, block self-review. The currently accepted
+   single-operator exception permits `lenglb` to approve its own deployment
+   after the enforced 15-minute wait timer; treat this as a documented residual
+   risk and enable self-review prevention as soon as a second operator exists.
 5. Keep the workflow token default at read-only. The publish job alone receives
    `packages: write`, `id-token: write`, and `attestations: write`.
 6. Keep the GHCR package linked only to this repository. Do not add a PAT or a
@@ -69,6 +72,115 @@ The image still excludes all PEM and key files as defense in depth. Existing
 environments must rotate any built-in JWT or SAML key matching the known public
 upstream fixture fingerprint
 `e9750c7433124b38d6d3c7aee87a65b64e80c3b6ec2cade26a9a9fadad061b4a`.
+
+### Authentication migration invariants
+
+Schema synchronization adds `applications.enable_saml` with a database default
+of `false`. Therefore every existing application, including `app-built-in`,
+browser clients, and machine-to-machine clients, remains unable to issue SAML
+assertions after upgrade. Enabling SAML requires a tenant-bound application and
+an absolute HTTPS reply URL (HTTP is accepted only for a loopback development
+URL). The request's `AssertionConsumerServiceURL` must then match that registered
+reply URL byte-for-byte. Shared applications cannot act as a SAML IdP.
+
+Password login requests should declare exactly `signinMethod: "Password"` or
+`signinMethod: "LDAP"`, and that method must be enabled on the application. For
+wire compatibility with legacy Casdoor clients, an empty selector may use only
+local password authentication and only while password login is enabled; it
+never enables LDAP fallback. Unknown non-empty methods fail before the local or
+LDAP password checker. A `Password` method with the `Non-LDAP` rule continues to
+authenticate local users without enabling LDAP fallback.
+
+The generic `/api/update-user` endpoint projects request bodies through separate
+self-service and admin field allowlists. Authentication credentials, MFA and
+WebAuthn material, verification flags, LDAP/provider links, and other
+system-maintained fields require purpose-built APIs. Explicit `columns` values
+outside the caller's allowlist are rejected. Updating an email address clears
+`email_verified` in the same database statement; only the verification flow may
+set it again.
+
+OAuth clients must explicitly list every permitted grant type, including
+`authorization_code`. An empty `grantTypes` list rejects every grant. Likewise,
+an empty application scope allowlist accepts only a request with no scope;
+browser clients must explicitly allow the scopes they use. The Werkblick
+migration sets browser clients to `authorization_code` plus
+`openid profile email`, and workload clients to their exact machine grant and
+scope set before this image is promoted.
+
+OIDC UserInfo now emits `email_verified` from the persisted user record. An
+unverified email is never upgraded to verified merely because the `email`
+scope was granted; downstream account linking must continue to require the
+claim to be true.
+
+Authorization codes are bound to the exact `redirect_uri`, explicit
+`authorization_code` grant, application, resource, scope and immutable user
+ID. The token request must repeat the same `redirect_uri`. Code redemption
+reloads the user and current application policy before atomically consuming the
+code. Human token issuance and refresh require AAL2 whenever the user has MFA
+enabled; a missing required-MFA enrollment also fails closed. Ordinary OIDC
+users without MFA remain AAL1-compatible, including users whose truthful
+`email_verified` claim is `false`.
+
+HTTP and generated-API clients redeeming an authorization code must now send
+`redirect_uri`. Go callers must migrate from `GetOAuthToken` to
+`GetOAuthTokenWithRedirectUri`, and from `GetAuthorizationCodeToken` or
+`GetAuthorizationCodeTokenForHost` to
+`GetAuthorizationCodeTokenWithRedirectUri` or
+`GetAuthorizationCodeTokenForHostAndRedirectUri`. The legacy helpers remain
+available for source compatibility, but authorization-code redemption through
+them intentionally fails closed.
+
+### Schema-only migration
+
+Run the new image once with the exact environment value
+`WERKBLICK_SCHEMA_MIGRATION_ONLY=true` before starting the service normally.
+This mode reads configuration, initializes the database adapter, runs Xorm
+`Sync2` through `CreateTables`, logs successful completion, and exits with code
+zero. It exits before `InitDb`, storage or log providers, LDAP, authorization,
+the user manager, import/sync jobs, webhook workers, and every HTTP, LDAP, or
+RADIUS listener. Values such as `TRUE`, `1`, or whitespace-padded `true` do not
+enable migration-only mode and therefore take the normal boot path.
+
+This step is required for the Werkblick r2 upgrade because the live schema has
+`expire_in_hours` as an integer while the fork now stores it as a floating-point
+value. Take and verify the database backup before running the schema-only job,
+then inspect the resulting column type before starting the new digest.
+
+The r2 schema also adds `token.subject varchar(100)` and
+`token.redirect_uri varchar(500)`. Existing token rows have no immutable
+subject or redirect binding and therefore cannot be refreshed or redeemed by
+the hardened paths. Plan the cutover as a forced reauthentication and do not
+promote the new digest while an authorization callback is in flight.
+
+Werkblick CI builds and loads the actual AMD64 image, creates a starting schema
+with the digest-pinned stock Casdoor 3.97.0 image on a digest-pinned PostgreSQL
+16 container, reproduces the observed integer TTL columns, and runs that image
+in migration-only mode on an isolated internal Docker network. Release is
+blocked unless the job exits zero, leaves no container running, converts both
+TTL columns to `double precision`, and creates every Werkblick OAuth/SAML token
+column. The executable contract lives in
+`scripts/verify-postgres-migration.sh` so the same proof can be invoked by an
+external deployment pipeline with its locally built candidate image.
+
+For an intentionally empty database, use the separate exact environment value
+`WERKBLICK_BOOTSTRAP_DATA_ONLY=true` with a versioned `initDataFile` mounted at
+the configured path. This mode initializes routes, flags, the database adapter
+and schema, then runs only `InitDb` and the required init-data import before
+exiting successfully. A missing configured init-data file is fatal. It does not
+initialize storage or log providers, LDAP, authorization, the user manager,
+cleanup or sync jobs, site monitoring, webhook delivery, or any listener.
+
+Schema-only and bootstrap-data-only are mutually exclusive. Setting both exact
+values to `true` fails before any initialization or database access.
+
+Normal first start creates only a random, forbidden built-in administrator;
+production activation therefore requires the validated bootstrap-data path.
+The upstream Cypress workflow does not weaken that runtime default: a
+build-tagged test-only helper seeds its isolated database with a masked,
+per-run random credential and gives only that isolated built-in client the
+`authorization_code` grant and `profile` scope before the server starts. The
+helper first verifies the grant-free runtime default and is absent from ordinary
+test builds and every production binary.
 
 ## Verification and rollback
 

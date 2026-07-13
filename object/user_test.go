@@ -63,6 +63,30 @@ func TestFaceIdUsesLowerCamelImageUrlJsonField(t *testing.T) {
 	}
 }
 
+func TestApplyEmailVerificationInvariant(t *testing.T) {
+	oldUser := &User{Email: "old@example.com", EmailVerified: true}
+	updatedUser := &User{Email: "new@example.com", EmailVerified: true}
+	columns := applyEmailVerificationInvariant(oldUser, updatedUser, []string{"display_name", "email"})
+	if updatedUser.EmailVerified {
+		t.Fatal("verification from the previous email address was retained")
+	}
+	if !util.InSlice(columns, "email_verified") {
+		t.Fatalf("email_verified is not part of the atomic update: %v", columns)
+	}
+
+	unchanged := &User{Email: oldUser.Email, EmailVerified: true}
+	columns = applyEmailVerificationInvariant(oldUser, unchanged, []string{"email"})
+	if !unchanged.EmailVerified || util.InSlice(columns, "email_verified") {
+		t.Fatalf("unchanged email unexpectedly lost verification: verified=%v columns=%v", unchanged.EmailVerified, columns)
+	}
+
+	notWritten := &User{Email: "different@example.com", EmailVerified: true}
+	columns = applyEmailVerificationInvariant(oldUser, notWritten, []string{"display_name"})
+	if !notWritten.EmailVerified || util.InSlice(columns, "email_verified") {
+		t.Fatalf("email outside the write set changed verification: verified=%v columns=%v", notWritten.EmailVerified, columns)
+	}
+}
+
 func TestSyncAvatarsFromGitHub(t *testing.T) {
 	InitConfig()
 
