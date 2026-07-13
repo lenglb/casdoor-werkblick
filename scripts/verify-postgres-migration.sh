@@ -129,7 +129,7 @@ assert_equal \
   "expire_in_hours:double precision,refresh_expire_in_hours:double precision" \
   "TTL columns were not migrated to double precision"
 
-missing_columns="$(query_scalar "WITH expected(table_name, column_name) AS (VALUES ('application', 'token_endpoint_auth_method'), ('application', 'enable_saml'), ('token', 'refresh_token_family'), ('token', 'refresh_token_consumed'), ('token', 'nonce'), ('token', 'auth_time'), ('token', 'authentication_methods'), ('token', 'authentication_provider')) SELECT count(*) FROM expected LEFT JOIN information_schema.columns c ON c.table_schema = 'public' AND c.table_name = expected.table_name AND c.column_name = expected.column_name WHERE c.column_name IS NULL;")"
+missing_columns="$(query_scalar "WITH expected(table_name, column_name) AS (VALUES ('application', 'token_endpoint_auth_method'), ('application', 'enable_saml'), ('token', 'refresh_token_family'), ('token', 'refresh_token_consumed'), ('token', 'nonce'), ('token', 'auth_time'), ('token', 'authentication_methods'), ('token', 'authentication_provider'), ('token', 'subject'), ('token', 'redirect_uri')) SELECT count(*) FROM expected LEFT JOIN information_schema.columns c ON c.table_schema = 'public' AND c.table_name = expected.table_name AND c.column_name = expected.column_name WHERE c.column_name IS NULL;")"
 assert_equal "$missing_columns" "0" "one or more Werkblick schema columns are missing"
 
 assert_equal \

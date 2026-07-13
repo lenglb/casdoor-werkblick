@@ -107,6 +107,15 @@ unverified email is never upgraded to verified merely because the `email`
 scope was granted; downstream account linking must continue to require the
 claim to be true.
 
+Authorization codes are bound to the exact `redirect_uri`, explicit
+`authorization_code` grant, application, resource, scope and immutable user
+ID. The token request must repeat the same `redirect_uri`. Code redemption
+reloads the user and current application policy before atomically consuming the
+code. Human token issuance and refresh require AAL2 whenever the user has MFA
+enabled; a missing required-MFA enrollment also fails closed. Ordinary OIDC
+users without MFA remain AAL1-compatible, including users whose truthful
+`email_verified` claim is `false`.
+
 ### Schema-only migration
 
 Run the new image once with the exact environment value
@@ -122,6 +131,12 @@ This step is required for the Werkblick r2 upgrade because the live schema has
 `expire_in_hours` as an integer while the fork now stores it as a floating-point
 value. Take and verify the database backup before running the schema-only job,
 then inspect the resulting column type before starting the new digest.
+
+The r2 schema also adds `token.subject varchar(100)` and
+`token.redirect_uri varchar(500)`. Existing token rows have no immutable
+subject or redirect binding and therefore cannot be refreshed or redeemed by
+the hardened paths. Plan the cutover as a forced reauthentication and do not
+promote the new digest while an authorization callback is in flight.
 
 Werkblick CI builds and loads the actual AMD64 image, creates a starting schema
 with the digest-pinned stock Casdoor 3.97.0 image on a digest-pinned PostgreSQL

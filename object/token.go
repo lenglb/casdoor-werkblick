@@ -32,6 +32,10 @@ type Token struct {
 	Application  string `xorm:"varchar(100)" json:"application"`
 	Organization string `xorm:"varchar(100)" json:"organization"`
 	User         string `xorm:"varchar(100)" json:"user"`
+	// Subject is the immutable user/application ID bound to this grant. Owner,
+	// organization and user names are mutable and therefore are not sufficient
+	// to prevent a deleted account name from being reused.
+	Subject string `xorm:"varchar(100)" json:"subject"`
 
 	Code                   string   `xorm:"varchar(100) index" json:"code"`
 	AccessToken            string   `xorm:"mediumtext" json:"accessToken"`
@@ -46,6 +50,7 @@ type Token struct {
 	TokenType              string   `xorm:"varchar(100)" json:"tokenType"`
 	GrantType              string   `xorm:"varchar(100)" json:"grantType"`
 	CodeChallenge          string   `xorm:"varchar(100)" json:"codeChallenge"`
+	RedirectUri            string   `xorm:"varchar(500)" json:"redirectUri"`
 	CodeIsUsed             bool     `json:"codeIsUsed"`
 	CodeExpireIn           int64    `json:"codeExpireIn"`
 	AuthTime               int64    `json:"authTime"`

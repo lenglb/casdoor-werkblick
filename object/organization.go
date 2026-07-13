@@ -592,7 +592,7 @@ func IsNeedPromptMfa(org *Organization, user *User) bool {
 		mfaItems = user.MfaItems
 	}
 	for _, item := range mfaItems {
-		if IsRequiredMfaType(org, user, item.Name) {
+		if item != nil && IsRequiredMfaType(org, user, item.Name) {
 			return true
 		}
 	}
@@ -608,7 +608,7 @@ func IsRequiredMfaType(org *Organization, user *User, mfaType string) bool {
 		mfaItems = user.MfaItems
 	}
 	for _, item := range mfaItems {
-		if item.Rule != "Required" || item.Name != mfaType {
+		if item == nil || item.Rule != "Required" || item.Name != mfaType {
 			continue
 		}
 		switch mfaType {

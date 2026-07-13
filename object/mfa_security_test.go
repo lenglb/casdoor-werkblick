@@ -18,10 +18,14 @@ import "testing"
 
 func TestIsRequiredMfaTypeUsesUserOverrideAndEnrollmentState(t *testing.T) {
 	organization := &Organization{MfaItems: []*MfaItem{
+		nil,
 		{Name: TotpType, Rule: "Required"},
 		{Name: EmailType, Rule: "Optional"},
 	}}
 	user := &User{}
+	if !IsNeedPromptMfa(organization, user) {
+		t.Fatal("nil MFA item hid required enrollment")
+	}
 	if !IsRequiredMfaType(organization, user, TotpType) {
 		t.Fatal("missing required TOTP was not detected")
 	}

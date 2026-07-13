@@ -442,6 +442,16 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		}, nil
 	}
 	scope = expandedScope
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil {
+		return nil, err
+	}
+	if tokenError != nil {
+		return &Code{Message: fmt.Sprintf("error: %s", tokenError.ErrorDescription), Code: ""}, nil
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, authenticationContext); tokenError != nil {
+		return &Code{Message: fmt.Sprintf("error: %s", tokenError.ErrorDescription), Code: ""}, nil
+	}
 
 	// Validate resource parameter (RFC 8707)
 	if err := validateResourceURI(resource); err != nil {
@@ -471,6 +481,7 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		Application:   application.Name,
 		Organization:  user.Owner,
 		User:          user.Name,
+		Subject:       user.Id,
 		Code:          util.GenerateClientId(),
 		AccessToken:   accessToken,
 		RefreshToken:  refreshToken,
@@ -478,7 +489,9 @@ func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authe
 		Scope:         scope,
 		Nonce:         nonce,
 		TokenType:     "Bearer",
+		GrantType:     "authorization_code",
 		CodeChallenge: challenge,
+		RedirectUri:   redirectUri,
 		CodeIsUsed:    false,
 		CodeExpireIn:  time.Now().Add(time.Minute * 5).Unix(),
 		Resource:      resource,
@@ -631,6 +644,12 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 			ErrorDescription: "refresh token authentication evidence does not match the persisted grant",
 		}, nil
 	}
+	if token.Subject == "" || oldToken.Subject != token.Subject {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token subject does not match the persisted immutable subject",
+		}, nil
+	}
 
 	if scope == "" {
 		scope = token.Scope
@@ -665,7 +684,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 	if user == nil {
 		return "", fmt.Errorf("The user: %s doesn't exist", util.GetId(token.Organization, token.User))
 	}
-	if oldToken.Subject != user.Id {
+	if oldToken.Subject != user.Id || token.Subject != user.Id {
 		return &TokenError{
 			Error:            InvalidGrant,
 			ErrorDescription: "refresh token subject does not match the persisted user",
@@ -680,17 +699,18 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		return tokenError, nil
 	}
 
-	err = ExtendUserWithRolesAndPermissions(user)
-	if err != nil {
-		return nil, err
-	}
-
 	authenticationContext, err := token.GetAuthenticationContext()
 	if err != nil {
 		return &TokenError{
 			Error:            InvalidGrant,
 			ErrorDescription: fmt.Sprintf("refresh token authentication context is invalid: %s", err.Error()),
 		}, nil
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, authenticationContext); tokenError != nil {
+		return tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(user); err != nil {
+		return nil, err
 	}
 
 	newTokenType := "Bearer"
@@ -742,6 +762,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		Application:        application.Name,
 		Organization:       user.Owner,
 		User:               user.Name,
+		Subject:            user.Id,
 		Code:               util.GenerateClientId(),
 		AccessToken:        newAccessToken,
 		RefreshToken:       newRefreshToken,
@@ -750,6 +771,7 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		TokenType:          newTokenType,
 		GrantType:          "refresh_token",
 		CodeChallenge:      token.CodeChallenge,
+		RedirectUri:        token.RedirectUri,
 		Resource:           token.Resource,
 		DPoPJkt:            newDPoPJkt,
 		RefreshTokenFamily: token.RefreshTokenFamily,
@@ -911,7 +933,10 @@ func mintImplicitToken(application *Application, username string, scope string, 
 	return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
 }
 
-func mintImplicitTokenWithAuthenticationContext(application *Application, username string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, *TokenError, error) {
+func mintImplicitTokenWithAuthenticationContext(application *Application, username string, requiredGrant string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: fmt.Sprintf("%s is not enabled for this application", requiredGrant)}, nil
+	}
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -940,7 +965,7 @@ func mintImplicitTokenWithAuthenticationContext(application *Application, userna
 	if authenticationContext == nil {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
 	}
-	token, err := GetTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, *authenticationContext)
+	token, err := GetTokenByUserForGrantWithAuthenticationContext(application, user, requiredGrant, scope, nonce, host, *authenticationContext)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1004,6 +1029,9 @@ func parseAndValidateSubjectToken(subjectToken string, requestingClientId string
 
 	if tokenType != "access-token" {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token is not an access token"}, nil
+	}
+	if record.Subject == "" || subject != record.Subject {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token subject does not match the persisted immutable subject"}, nil
 	}
 	if azp != issuingApp.ClientId || signedScope != record.Scope {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token claims do not match the persisted grant"}, nil
@@ -1146,12 +1174,14 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		Application:   application.Name,
 		Organization:  guestUser.Owner,
 		User:          guestUser.Name,
+		Subject:       guestUser.Id,
 		Code:          util.GenerateClientId(),
 		AccessToken:   accessToken,
 		RefreshToken:  refreshToken,
 		ExpiresIn:     int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:         "",
 		TokenType:     "Bearer",
+		GrantType:     "authorization_code",
 		CodeChallenge: "",
 		CodeIsUsed:    true,
 		CodeExpireIn:  0,

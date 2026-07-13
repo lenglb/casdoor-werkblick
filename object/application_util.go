@@ -462,7 +462,7 @@ func (application *Application) IsPasswordWithLdapEnabled() bool {
 		return application.EnablePassword
 	} else {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "Password" && signinMethod.Rule == "All" {
+			if signinMethod != nil && signinMethod.Name == "Password" && signinMethod.Rule == "All" {
 				return true
 			}
 		}
@@ -475,7 +475,7 @@ func (application *Application) IsCodeSigninViaEmailEnabled() bool {
 		return application.EnableCodeSignin
 	} else {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "Verification code" && signinMethod.Rule != "Phone only" {
+			if signinMethod != nil && signinMethod.Name == "Verification code" && signinMethod.Rule != "Phone only" {
 				return true
 			}
 		}
@@ -488,7 +488,7 @@ func (application *Application) IsCodeSigninViaSmsEnabled() bool {
 		return application.EnableCodeSignin
 	} else {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "Verification code" && signinMethod.Rule != "Email only" {
+			if signinMethod != nil && signinMethod.Name == "Verification code" && signinMethod.Rule != "Email only" {
 				return true
 			}
 		}
@@ -499,7 +499,7 @@ func (application *Application) IsCodeSigninViaSmsEnabled() bool {
 func (application *Application) IsLdapEnabled() bool {
 	if len(application.SigninMethods) > 0 {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "LDAP" {
+			if signinMethod != nil && signinMethod.Name == "LDAP" {
 				return true
 			}
 		}
@@ -510,7 +510,7 @@ func (application *Application) IsLdapEnabled() bool {
 func (application *Application) IsFaceIdEnabled() bool {
 	if len(application.SigninMethods) > 0 {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "Face ID" {
+			if signinMethod != nil && signinMethod.Name == "Face ID" {
 				return true
 			}
 		}

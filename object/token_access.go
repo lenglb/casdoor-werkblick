@@ -20,6 +20,29 @@ import (
 	"github.com/casdoor/casdoor/util"
 )
 
+// validateUserTokenAuthenticationPolicy applies the assurance requirement that
+// must hold at every human-token issuance boundary. Authentication context is
+// server-established evidence, while the user is freshly reloaded immediately
+// before this function is called. Email verification is deliberately not a
+// global OIDC gate: the signed email_verified claim reports the persisted
+// state, while privileged operator access is enforced by the console gate.
+func validateUserTokenAuthenticationPolicy(user *User, _ string, authenticationContext AuthenticationContext) *TokenError {
+	if user == nil {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "token subject does not identify a user"}
+	}
+	preserved, err := PreserveAuthenticationContext(authenticationContext)
+	if err != nil {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("authentication context is invalid: %s", err.Error())}
+	}
+	if preserved.Subject != user.GetId() {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "authentication context subject does not match the persisted user"}
+	}
+	if user.IsMfaEnabled() && GetAuthenticationContextClass(preserved.Amr) != AuthenticationContextClassAal2 {
+		return &TokenError{Error: InvalidGrant, ErrorDescription: "multi-factor authentication is required; authenticate again"}
+	}
+	return nil
+}
+
 // revalidateUserTokenAccess reloads a user and re-evaluates the durable access
 // policy immediately before a user token is minted. A password, assertion,
 // refresh token, or subject token proves authentication; it does not preserve
@@ -39,6 +62,9 @@ func revalidateUserTokenAccess(application *Application, previouslyLoadedUser *U
 	}
 	if user == nil {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "the user no longer exists"}, nil
+	}
+	if user.Id == "" {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "the persisted user has no immutable subject ID"}, nil
 	}
 	// Do not let a deleted-and-recreated account inherit an old assertion,
 	// refresh token, or subject token merely because the username was reused.
@@ -67,6 +93,9 @@ func revalidateUserTokenAccess(application *Application, previouslyLoadedUser *U
 	}
 	if organization.DisableSignin {
 		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "the organization has disabled user sign-in"}, nil
+	}
+	if IsNeedPromptMfa(organization, user) {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "required MFA enrollment is incomplete; authenticate again"}, nil
 	}
 
 	allowed, err := CheckLoginPermission(user.GetId(), application)

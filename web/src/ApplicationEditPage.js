@@ -194,7 +194,7 @@ class ApplicationEditPage extends React.Component {
         this.getCerts(application);
 
         if (application.enableSaml) {
-          this.getSamlMetadata(application.enableSamlPostBinding);
+          this.getSamlMetadata(application.enableSamlPostBinding, application);
         }
       });
   }
@@ -244,8 +244,8 @@ class ApplicationEditPage extends React.Component {
       });
   }
 
-  getSamlMetadata(checked) {
-    if (!this.state.application?.enableSaml) {
+  getSamlMetadata(checked, application = this.state.application) {
+    if (!application?.enableSaml) {
       this.setState({
         samlMetadata: null,
       });

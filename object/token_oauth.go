@@ -25,6 +25,18 @@ import (
 )
 
 func GetOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, scope string, nonce string, username string, password string, host string, refreshToken string, tag string, avatar string, lang string, subjectToken string, subjectTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, deviceCode string, dpopProof string, clientAuthentication *OAuthClientAuthentication, authenticationContexts ...*AuthenticationContext) (interface{}, error) {
+	return getOAuthToken(grantType, clientId, clientSecret, code, verifier, "", scope, nonce, username, password, host, refreshToken, tag, avatar, lang, subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, deviceCode, dpopProof, clientAuthentication, authenticationContexts...)
+}
+
+// GetOAuthTokenWithRedirectUri binds authorization-code redemption to the
+// exact redirect URI from the authorization request. The legacy entry point is
+// retained for source compatibility, but cannot redeem newly issued codes
+// because those always carry a non-empty redirect URI binding.
+func GetOAuthTokenWithRedirectUri(grantType string, clientId string, clientSecret string, code string, verifier string, redirectUri string, scope string, nonce string, username string, password string, host string, refreshToken string, tag string, avatar string, lang string, subjectToken string, subjectTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, deviceCode string, dpopProof string, clientAuthentication *OAuthClientAuthentication, authenticationContexts ...*AuthenticationContext) (interface{}, error) {
+	return getOAuthToken(grantType, clientId, clientSecret, code, verifier, redirectUri, scope, nonce, username, password, host, refreshToken, tag, avatar, lang, subjectToken, subjectTokenType, assertion, clientAssertion, clientAssertionType, audience, resource, deviceCode, dpopProof, clientAuthentication, authenticationContexts...)
+}
+
+func getOAuthToken(grantType string, clientId string, clientSecret string, code string, verifier string, redirectUri string, scope string, nonce string, username string, password string, host string, refreshToken string, tag string, avatar string, lang string, subjectToken string, subjectTokenType string, assertion string, clientAssertion string, clientAssertionType string, audience string, resource string, deviceCode string, dpopProof string, clientAuthentication *OAuthClientAuthentication, authenticationContexts ...*AuthenticationContext) (interface{}, error) {
 	var authenticationContext *AuthenticationContext
 	if len(authenticationContexts) > 0 {
 		authenticationContext = authenticationContexts[0]
@@ -112,13 +124,13 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 
 	switch grantType {
 	case "authorization_code": // Authorization Code Grant
-		token, tokenError, err = getAuthorizationCodeToken(application, clientSecret, code, verifier, resource, host, dpopJkt)
+		token, tokenError, err = getAuthorizationCodeToken(application, clientSecret, code, verifier, redirectUri, resource, host, dpopJkt)
 	case "password": // Resource Owner Password Credentials Grant
 		token, tokenError, err = GetPasswordToken(application, username, password, scope, host)
 	case "client_credentials": // Client Credentials Grant
 		token, tokenError, err = GetClientCredentialsToken(application, clientSecret, scope, host)
 	case "token", "id_token": // Implicit Grant
-		token, tokenError, err = GetImplicitToken(application, username, password, scope, nonce, host)
+		token, tokenError, err = getImplicitTokenForGrant(application, username, password, grantType, scope, nonce, host)
 	case "urn:ietf:params:oauth:grant-type:jwt-bearer":
 		token, tokenError, err = GetJwtBearerToken(application, assertion, scope, nonce, host)
 	case "urn:ietf:params:oauth:grant-type:device_code":
@@ -134,7 +146,7 @@ func GetOAuthToken(grantType string, clientId string, clientSecret string, code 
 		// The user has already authenticated via browser in the device flow.
 		// The atomic claim above is the single-use boundary, so only this
 		// request may mint the resulting token family.
-		token, tokenError, err = mintImplicitTokenWithAuthenticationContext(application, username, scope, nonce, host, authenticationContext)
+		token, tokenError, err = mintImplicitTokenWithAuthenticationContext(application, username, grantType, scope, nonce, host, authenticationContext)
 	case "urn:ietf:params:oauth:grant-type:token-exchange": // Token Exchange Grant (RFC 8693)
 		token, tokenError, err = GetTokenExchangeToken(application, clientSecret, subjectToken, subjectTokenType, audience, scope, host, dpopJkt)
 	case "refresh_token":
@@ -299,14 +311,22 @@ func bindIssuedTokenToDPoP(application *Application, token *Token, dpopJkt strin
 
 // GetAuthorizationCodeToken handles the Authorization Code Grant flow.
 func GetAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, resource string) (*Token, *TokenError, error) {
-	return getAuthorizationCodeToken(application, clientSecret, code, verifier, resource, "", "")
+	return getAuthorizationCodeToken(application, clientSecret, code, verifier, "", resource, "", "")
 }
 
 func GetAuthorizationCodeTokenForHost(application *Application, clientSecret string, code string, verifier string, resource string, host string) (*Token, *TokenError, error) {
-	return getAuthorizationCodeToken(application, clientSecret, code, verifier, resource, host, "")
+	return getAuthorizationCodeToken(application, clientSecret, code, verifier, "", resource, host, "")
 }
 
-func getAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, resource string, host string, dpopJkt string) (*Token, *TokenError, error) {
+func GetAuthorizationCodeTokenWithRedirectUri(application *Application, clientSecret string, code string, verifier string, redirectUri string, resource string) (*Token, *TokenError, error) {
+	return getAuthorizationCodeToken(application, clientSecret, code, verifier, redirectUri, resource, "", "")
+}
+
+func GetAuthorizationCodeTokenForHostAndRedirectUri(application *Application, clientSecret string, code string, verifier string, redirectUri string, resource string, host string) (*Token, *TokenError, error) {
+	return getAuthorizationCodeToken(application, clientSecret, code, verifier, redirectUri, resource, host, "")
+}
+
+func getAuthorizationCodeToken(application *Application, clientSecret string, code string, verifier string, redirectUri string, resource string, host string, dpopJkt string) (*Token, *TokenError, error) {
 	if application == nil || !IsGrantTypeValid("authorization_code", application.GrantTypes) {
 		return nil, &TokenError{
 			Error:            UnsupportedGrantType,
@@ -368,6 +388,12 @@ func getAuthorizationCodeToken(application *Application, clientSecret string, co
 			ErrorDescription: fmt.Sprintf("authorization code has been used for token: [%s]", token.GetId()),
 		}, nil
 	}
+	if token.GrantType != "authorization_code" {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "authorization code grant binding is missing or invalid",
+		}, nil
+	}
 
 	if token.CodeChallenge != "" {
 		challengeAnswer := pkceChallenge(verifier)
@@ -399,6 +425,12 @@ func getAuthorizationCodeToken(application *Application, clientSecret string, co
 			ErrorDescription: "authorization code was not issued to this application",
 		}, nil
 	}
+	if token.RedirectUri == "" || redirectUri == "" || redirectUri != token.RedirectUri {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "redirect_uri does not match the authorization request",
+		}, nil
+	}
 
 	// RFC 8707: Validate resource parameter matches the one in the authorization request
 	if resource != token.Resource {
@@ -417,27 +449,37 @@ func getAuthorizationCodeToken(application *Application, clientSecret string, co
 		}, nil
 	}
 
+	if token.Subject == "" {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "authorization code has no immutable subject binding"}, nil
+	}
+	user, accessError, userErr := revalidateUserTokenAccess(application, &User{Owner: token.Organization, Name: token.User, Id: token.Subject})
+	if userErr != nil {
+		return nil, nil, userErr
+	}
+	if accessError != nil {
+		return nil, accessError, nil
+	}
+	if user == nil {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "authorization code user no longer exists"}, nil
+	}
+	if _, ok := IsScopeValidAndExpand(token.Scope, application); !ok {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "authorization code scope is no longer allowed by the application"}, nil
+	}
+	authenticationContext, contextErr := token.GetAuthenticationContext()
+	if contextErr != nil {
+		return nil, &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("authorization code authentication context is invalid: %s", contextErr.Error()),
+		}, nil
+	}
+	if policyError := validateUserTokenAuthenticationPolicy(user, token.Scope, authenticationContext); policyError != nil {
+		return nil, policyError, nil
+	}
+
 	var replacement *authorizationCodeTokenReplacement
 	if dpopJkt != "" {
-		user, userErr := getUser(token.Organization, token.User)
-		if userErr != nil {
-			return nil, nil, userErr
-		}
-		if user == nil {
-			return nil, &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: "authorization code user no longer exists",
-			}, nil
-		}
 		if userErr = ExtendUserWithRolesAndPermissions(user); userErr != nil {
 			return nil, nil, userErr
-		}
-		authenticationContext, contextErr := token.GetAuthenticationContext()
-		if contextErr != nil {
-			return nil, &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: fmt.Sprintf("authorization code authentication context is invalid: %s", contextErr.Error()),
-			}, nil
 		}
 		accessToken, refreshToken, _, tokenErr := generateJwtTokenWithAuthenticationContextAndDPoP(
 			application,
@@ -484,6 +526,9 @@ func getAuthorizationCodeToken(application *Application, clientSecret string, co
 
 // GetPasswordToken handles the Resource Owner Password Credentials Grant flow.
 func GetPasswordToken(application *Application, username string, password string, scope string, host string) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid("password", application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: "password is not enabled for this application"}, nil
+	}
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -528,11 +573,6 @@ func GetPasswordToken(application *Application, username string, password string
 		return nil, tokenError, err
 	}
 
-	err = ExtendUserWithRolesAndPermissions(user)
-	if err != nil {
-		return nil, nil, err
-	}
-
 	authenticationMethods, err := GetVerifiedPasswordAuthenticationMethods(user, password)
 	if err != nil {
 		return nil, nil, err
@@ -543,6 +583,12 @@ func GetPasswordToken(application *Application, username string, password string
 		Amr:      authenticationMethods,
 	})
 	if err != nil {
+		return nil, nil, err
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, authenticationContext); tokenError != nil {
+		return nil, tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(user); err != nil {
 		return nil, nil, err
 	}
 
@@ -560,12 +606,14 @@ func GetPasswordToken(application *Application, username string, password string
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
+		Subject:      user.Id,
 		Code:         util.GenerateClientId(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        scope,
 		TokenType:    "Bearer",
+		GrantType:    "password",
 		CodeIsUsed:   true,
 	}
 	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
@@ -581,6 +629,9 @@ func GetPasswordToken(application *Application, username string, password string
 
 // GetClientCredentialsToken handles the Client Credentials Grant flow.
 func GetClientCredentialsToken(application *Application, clientSecret string, scope string, host string) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid("client_credentials", application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: "client_credentials is not enabled for this application"}, nil
+	}
 	if application.IsPublicClient() || subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
 		return nil, &TokenError{
 			Error:            InvalidClient,
@@ -616,6 +667,7 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 		Application:  application.Name,
 		Organization: application.Organization,
 		User:         nullUser.Name,
+		Subject:      nullUser.Id,
 		Code:         util.GenerateClientId(),
 		AccessToken:  accessToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
@@ -634,6 +686,13 @@ func GetClientCredentialsToken(application *Application, clientSecret string, sc
 
 // GetImplicitToken handles the Implicit Grant flow (requires password verification).
 func GetImplicitToken(application *Application, username string, password string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+	return getImplicitTokenForGrant(application, username, password, "token", scope, nonce, host)
+}
+
+func getImplicitTokenForGrant(application *Application, username string, password string, requiredGrant string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+	if application == nil || !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: fmt.Sprintf("%s is not enabled for this application", requiredGrant)}, nil
+	}
 	user, err := GetUserByFieldsForSharedApp(application, application.Organization, username)
 	if err != nil {
 		return nil, nil, err
@@ -675,11 +734,15 @@ func GetImplicitToken(application *Application, username string, password string
 	if err != nil {
 		return nil, nil, err
 	}
-	return mintImplicitTokenWithAuthenticationContext(application, username, scope, nonce, host, &authenticationContext)
+	return mintImplicitTokenWithAuthenticationContext(application, username, requiredGrant, scope, nonce, host, &authenticationContext)
 }
 
 // GetJwtBearerToken handles the JWT Bearer Grant flow (RFC 7523).
 func GetJwtBearerToken(application *Application, assertion string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+	const grantType = "urn:ietf:params:oauth:grant-type:jwt-bearer"
+	if application == nil || !IsGrantTypeValid(grantType, application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: "JWT bearer is not enabled for this application"}, nil
+	}
 	ok, claims, err := ValidateJwtAssertion(assertion, application, host)
 	if err != nil || !ok {
 		if err != nil {
@@ -713,7 +776,7 @@ func GetJwtBearerToken(application *Application, assertion string, scope string,
 	if err != nil {
 		return nil, nil, err
 	}
-	return mintImplicitTokenWithAuthenticationContext(application, user.Name, scope, nonce, host, &authenticationContext)
+	return mintImplicitTokenWithAuthenticationContext(application, user.Name, grantType, scope, nonce, host, &authenticationContext)
 }
 
 // GetTokenByUser mints a token for the given user (Implicit flow helper).
@@ -722,17 +785,17 @@ func GetTokenByUser(application *Application, user *User, scope string, nonce st
 }
 
 func GetTokenByUserWithAuthenticationContext(application *Application, user *User, scope string, nonce string, host string, authenticationContext AuthenticationContext) (*Token, error) {
-	return getTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, &authenticationContext)
+	return nil, fmt.Errorf("explicit OAuth grant type is required to issue a user token")
 }
 
 func GetTokenByUserForGrantWithAuthenticationContext(application *Application, user *User, requiredGrant string, scope string, nonce string, host string, authenticationContext AuthenticationContext) (*Token, error) {
 	if application == nil || !IsGrantTypeValid(requiredGrant, application.GrantTypes) {
 		return nil, fmt.Errorf("OAuth grant type %q is not enabled for this application", requiredGrant)
 	}
-	return getTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, &authenticationContext)
+	return getTokenByUserWithAuthenticationContext(application, user, requiredGrant, scope, nonce, host, &authenticationContext)
 }
 
-func getTokenByUserWithAuthenticationContext(application *Application, user *User, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, error) {
+func getTokenByUserWithAuthenticationContext(application *Application, user *User, requiredGrant string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, error) {
 	if application == nil || authenticationContext == nil {
 		return nil, fmt.Errorf("application and trusted authentication context are required")
 	}
@@ -752,6 +815,9 @@ func getTokenByUserWithAuthenticationContext(application *Application, user *Use
 		return nil, err
 	}
 	if tokenError != nil {
+		return nil, fmt.Errorf("%s: %s", tokenError.Error, tokenError.ErrorDescription)
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, preservedContext); tokenError != nil {
 		return nil, fmt.Errorf("%s: %s", tokenError.Error, tokenError.ErrorDescription)
 	}
 	scope = expandedScope
@@ -779,6 +845,7 @@ func getTokenByUserWithAuthenticationContext(application *Application, user *Use
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
+		Subject:      user.Id,
 		Code:         util.GenerateClientId(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
@@ -786,6 +853,7 @@ func getTokenByUserWithAuthenticationContext(application *Application, user *Use
 		Scope:        scope,
 		Nonce:        nonce,
 		TokenType:    "Bearer",
+		GrantType:    requiredGrant,
 		CodeIsUsed:   true,
 	}
 	if authenticationContext != nil {
@@ -803,6 +871,9 @@ func getTokenByUserWithAuthenticationContext(application *Application, user *Use
 
 // GetWechatMiniProgramToken handles the WeChat Mini Program flow.
 func GetWechatMiniProgramToken(application *Application, code string, host string, username string, avatar string, lang string) (*Token, *TokenError, error) {
+	if application == nil {
+		return nil, &TokenError{Error: InvalidClient, ErrorDescription: "application does not exist"}, nil
+	}
 	mpProvider := GetWechatMiniProgramProvider(application)
 	if mpProvider == nil {
 		return nil, &TokenError{
@@ -880,10 +951,9 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 			return nil, nil, err
 		}
 	}
-
-	err = ExtendUserWithRolesAndPermissions(user)
-	if err != nil {
-		return nil, nil, err
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil || tokenError != nil {
+		return nil, tokenError, err
 	}
 
 	authenticationContext, err := PreserveAuthenticationContext(AuthenticationContext{
@@ -893,6 +963,12 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 		Provider: provider.Name,
 	})
 	if err != nil {
+		return nil, nil, err
+	}
+	if tokenError = validateUserTokenAuthenticationPolicy(user, "", authenticationContext); tokenError != nil {
+		return nil, tokenError, nil
+	}
+	if err = ExtendUserWithRolesAndPermissions(user); err != nil {
 		return nil, nil, err
 	}
 	accessToken, refreshToken, tokenName, err := generateJwtTokenWithAuthenticationContext(application, user, authenticationContext, "", "", "", host)
@@ -910,12 +986,14 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
+		Subject:      user.Id,
 		Code:         util.GenerateClientId(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:        "",
 		TokenType:    "Bearer",
+		GrantType:    "wechat_miniprogram",
 		CodeIsUsed:   true,
 	}
 	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
@@ -931,6 +1009,10 @@ func GetWechatMiniProgramToken(application *Application, code string, host strin
 // GetTokenExchangeToken handles the Token Exchange Grant flow (RFC 8693).
 // Exchanges a subject token for a new token with different audience or scope.
 func GetTokenExchangeToken(application *Application, clientSecret string, subjectToken string, subjectTokenType string, audience string, scope string, host string, dpopJkts ...string) (*Token, *TokenError, error) {
+	const grantType = "urn:ietf:params:oauth:grant-type:token-exchange"
+	if application == nil || !IsGrantTypeValid(grantType, application.GrantTypes) {
+		return nil, &TokenError{Error: UnsupportedGrantType, ErrorDescription: "token exchange is not enabled for this application"}, nil
+	}
 	if application.IsPublicClient() || subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
 		return nil, &TokenError{
 			Error:            InvalidClient,
@@ -1022,6 +1104,9 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		}
 	}
 	scope = expandedScope
+	if tokenError = validateUserTokenAuthenticationPolicy(user, scope, validatedSubject.AuthenticationContext); tokenError != nil {
+		return nil, tokenError, nil
+	}
 
 	err = ExtendUserWithRolesAndPermissions(user)
 	if err != nil {
@@ -1052,6 +1137,7 @@ func GetTokenExchangeToken(application *Application, clientSecret string, subjec
 		Application:  application.Name,
 		Organization: user.Owner,
 		User:         user.Name,
+		Subject:      user.Id,
 		Code:         util.GenerateClientId(),
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,

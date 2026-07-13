@@ -17,10 +17,17 @@ package object
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+)
+
+const (
+	tokenSecurityOrganization = "security-test-org"
+	tokenSecurityUserID       = "security-test-user-id"
+	tokenSecurityRedirect     = "https://client.example.test/callback"
 )
 
 func setupTokenSecurityTestOrmer(t *testing.T) {
@@ -34,9 +41,17 @@ func setupTokenSecurityTestOrmer(t *testing.T) {
 		t.Fatalf("create SQLite adapter: %v", err)
 	}
 	testOrmer.Engine.SetMaxOpenConns(8)
-	if err = testOrmer.Engine.Sync2(new(Token)); err != nil {
+	if err = testOrmer.Engine.Sync2(new(Token), new(User), new(Organization), new(Permission)); err != nil {
 		testOrmer.close()
-		t.Fatalf("create token table: %v", err)
+		t.Fatalf("create token security tables: %v", err)
+	}
+	if _, err = testOrmer.Engine.Insert(&Organization{Owner: "admin", Name: tokenSecurityOrganization}); err != nil {
+		testOrmer.close()
+		t.Fatalf("insert token security organization: %v", err)
+	}
+	if _, err = testOrmer.Engine.Insert(&User{Owner: tokenSecurityOrganization, Name: "alice", Id: tokenSecurityUserID, Email: "alice@example.test", EmailVerified: true}); err != nil {
+		testOrmer.close()
+		t.Fatalf("insert token security user: %v", err)
 	}
 	ormer = testOrmer
 
@@ -52,20 +67,26 @@ func TestAuthorizationCodeCanOnlyBeConsumedOnce(t *testing.T) {
 	application := &Application{
 		Owner:        "admin",
 		Name:         "security-test-app",
+		Organization: tokenSecurityOrganization,
 		ClientId:     "security-test-client",
 		ClientSecret: "security-test-secret",
 		GrantTypes:   []string{"authorization_code"},
 	}
 	token := &Token{
-		Owner:        application.Owner,
-		Name:         "authorization-code-token",
-		Application:  application.Name,
-		Organization: "security-test-org",
-		User:         "alice",
-		Code:         "single-use-authorization-code",
-		CodeIsUsed:   false,
-		CodeExpireIn: time.Now().Add(time.Minute).Unix(),
-		TokenType:    "Bearer",
+		Owner:                 application.Owner,
+		Name:                  "authorization-code-token",
+		Application:           application.Name,
+		Organization:          tokenSecurityOrganization,
+		User:                  "alice",
+		Subject:               tokenSecurityUserID,
+		Code:                  "single-use-authorization-code",
+		CodeIsUsed:            false,
+		CodeExpireIn:          time.Now().Add(time.Minute).Unix(),
+		TokenType:             "Bearer",
+		GrantType:             "authorization_code",
+		RedirectUri:           tokenSecurityRedirect,
+		AuthTime:              time.Now().Unix(),
+		AuthenticationMethods: []string{"pwd"},
 	}
 	if _, err := AddToken(token); err != nil {
 		t.Fatalf("add token: %v", err)
@@ -83,11 +104,12 @@ func TestAuthorizationCodeCanOnlyBeConsumedOnce(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			result, tokenError, err := GetAuthorizationCodeToken(
+			result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(
 				application,
 				application.ClientSecret,
 				token.Code,
 				"",
+				tokenSecurityRedirect,
 				"",
 			)
 			switch {
@@ -131,28 +153,34 @@ func TestInvalidAuthorizationCodeRequestDoesNotConsumeCode(t *testing.T) {
 	application := &Application{
 		Owner:                   "admin",
 		Name:                    "security-test-app",
+		Organization:            tokenSecurityOrganization,
 		ClientId:                "security-test-client",
 		TokenEndpointAuthMethod: "none",
 		GrantTypes:              []string{"authorization_code"},
 	}
 	verifier := "correct-verifier"
 	token := &Token{
-		Owner:         application.Owner,
-		Name:          "pkce-token",
-		Application:   application.Name,
-		Organization:  "security-test-org",
-		User:          "alice",
-		Code:          "pkce-authorization-code",
-		CodeChallenge: pkceChallenge(verifier),
-		CodeIsUsed:    false,
-		CodeExpireIn:  time.Now().Add(time.Minute).Unix(),
-		TokenType:     "Bearer",
+		Owner:                 application.Owner,
+		Name:                  "pkce-token",
+		Application:           application.Name,
+		Organization:          tokenSecurityOrganization,
+		User:                  "alice",
+		Subject:               tokenSecurityUserID,
+		Code:                  "pkce-authorization-code",
+		CodeChallenge:         pkceChallenge(verifier),
+		CodeIsUsed:            false,
+		CodeExpireIn:          time.Now().Add(time.Minute).Unix(),
+		TokenType:             "Bearer",
+		GrantType:             "authorization_code",
+		RedirectUri:           tokenSecurityRedirect,
+		AuthTime:              time.Now().Unix(),
+		AuthenticationMethods: []string{"pwd"},
 	}
 	if _, err := AddToken(token); err != nil {
 		t.Fatalf("add token: %v", err)
 	}
 
-	result, tokenError, err := GetAuthorizationCodeToken(application, "", token.Code, "wrong-verifier", "")
+	result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, "", token.Code, "wrong-verifier", tokenSecurityRedirect, "")
 	if err != nil {
 		t.Fatalf("invalid exchange returned internal error: %v", err)
 	}
@@ -168,7 +196,7 @@ func TestInvalidAuthorizationCodeRequestDoesNotConsumeCode(t *testing.T) {
 		t.Fatalf("invalid PKCE request consumed the code: %s", fmt.Sprintf("%#v", stored))
 	}
 
-	result, tokenError, err = GetAuthorizationCodeToken(application, "", token.Code, verifier, "")
+	result, tokenError, err = GetAuthorizationCodeTokenWithRedirectUri(application, "", token.Code, verifier, tokenSecurityRedirect, "")
 	if err != nil || tokenError != nil || result == nil {
 		t.Fatalf("valid exchange after invalid attempt = (%#v, %#v, %v)", result, tokenError, err)
 	}
@@ -193,13 +221,15 @@ func TestConfidentialClientPKCEDoesNotBypassClientSecret(t *testing.T) {
 		User:          "alice",
 		Code:          "confidential-authorization-code",
 		CodeChallenge: pkceChallenge(verifier),
+		GrantType:     "authorization_code",
+		RedirectUri:   tokenSecurityRedirect,
 		CodeExpireIn:  time.Now().Add(time.Minute).Unix(),
 	}
 	if _, err := AddToken(token); err != nil {
 		t.Fatalf("add token: %v", err)
 	}
 
-	result, tokenError, err := GetAuthorizationCodeToken(application, "", token.Code, verifier, "")
+	result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, "", token.Code, verifier, tokenSecurityRedirect, "")
 	if err != nil {
 		t.Fatalf("exchange returned internal error: %v", err)
 	}
@@ -227,18 +257,174 @@ func TestAuthorizationCodeIsBoundToApplicationOwner(t *testing.T) {
 		Organization: "security-test-org",
 		User:         "alice",
 		Code:         "owner-bound-authorization-code",
+		GrantType:    "authorization_code",
+		RedirectUri:  tokenSecurityRedirect,
 		CodeExpireIn: time.Now().Add(time.Minute).Unix(),
 	}
 	if _, err := AddToken(token); err != nil {
 		t.Fatalf("add token: %v", err)
 	}
 
-	result, tokenError, err := GetAuthorizationCodeToken(requestingApplication, requestingApplication.ClientSecret, token.Code, "", "")
+	result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(requestingApplication, requestingApplication.ClientSecret, token.Code, "", tokenSecurityRedirect, "")
 	if err != nil {
 		t.Fatalf("exchange returned internal error: %v", err)
 	}
 	if result != nil || tokenError == nil || tokenError.Error != InvalidGrant {
 		t.Fatalf("exchange = (%#v, %#v), want invalid_grant", result, tokenError)
+	}
+}
+
+func TestAuthorizationCodeRedemptionRechecksRedirectSubjectUserAndAssurance(t *testing.T) {
+	const redirectUri = "https://client.example.test/callback"
+	tests := []struct {
+		name              string
+		requestedRedirect string
+		scope             string
+		subject           string
+		omitSubject       bool
+		methods           []string
+		mutateUser        func(*User)
+		wantError         string
+	}{
+		{
+			name:              "redirect URI mismatch",
+			requestedRedirect: "https://attacker.example.test/callback",
+			wantError:         "redirect_uri",
+		},
+		{
+			name:              "redirect URI missing",
+			requestedRedirect: "",
+			wantError:         "redirect_uri",
+		},
+		{
+			name:              "immutable subject mismatch",
+			requestedRedirect: redirectUri,
+			subject:           "deleted-user-id",
+			wantError:         "no longer identifies",
+		},
+		{
+			name:              "immutable subject missing",
+			requestedRedirect: redirectUri,
+			omitSubject:       true,
+			wantError:         "no immutable subject",
+		},
+		{
+			name:              "user forbidden after authorization",
+			requestedRedirect: redirectUri,
+			mutateUser:        func(user *User) { user.IsForbidden = true },
+			wantError:         "forbidden",
+		},
+		{
+			name:              "MFA enabled after AAL1 authorization",
+			requestedRedirect: redirectUri,
+			mutateUser:        func(user *User) { user.TotpSecret = "newly-enrolled" },
+			wantError:         "multi-factor authentication",
+		},
+		{
+			name:              "ordinary unverified email user remains OIDC-compatible",
+			requestedRedirect: redirectUri,
+			scope:             "email",
+			mutateUser:        func(user *User) { user.EmailVerified = false },
+		},
+		{
+			name:              "scope revalidation is order insensitive",
+			requestedRedirect: redirectUri,
+			scope:             "email openid",
+		},
+		{
+			name:              "server-bound AAL2 remains valid",
+			requestedRedirect: redirectUri,
+			methods:           []string{"pwd", "otp"},
+			mutateUser:        func(user *User) { user.TotpSecret = "enrolled" },
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			setupTokenSecurityTestOrmer(t)
+			application := &Application{
+				Owner:        "admin",
+				Name:         "security-test-app",
+				Organization: tokenSecurityOrganization,
+				ClientId:     "security-test-client",
+				ClientSecret: "security-test-secret",
+				GrantTypes:   []string{"authorization_code"},
+				Scopes:       []*ScopeItem{{Name: "openid"}, {Name: "email"}},
+			}
+			user, err := getUser(tokenSecurityOrganization, "alice")
+			if err != nil || user == nil {
+				t.Fatalf("load user = (%#v, %v)", user, err)
+			}
+			if test.mutateUser != nil {
+				test.mutateUser(user)
+				if _, err = ormer.Engine.ID([]interface{}{user.Owner, user.Name}).Cols("is_forbidden", "totp_secret", "email_verified").Update(user); err != nil {
+					t.Fatalf("update user: %v", err)
+				}
+			}
+			subject := test.subject
+			if subject == "" && !test.omitSubject {
+				subject = tokenSecurityUserID
+			}
+			methods := test.methods
+			if len(methods) == 0 {
+				methods = []string{"pwd"}
+			}
+			token := &Token{
+				Owner:                 application.Owner,
+				Name:                  "bound-code-token",
+				Application:           application.Name,
+				Organization:          tokenSecurityOrganization,
+				User:                  "alice",
+				Subject:               subject,
+				Code:                  "bound-authorization-code",
+				GrantType:             "authorization_code",
+				CodeExpireIn:          time.Now().Add(time.Minute).Unix(),
+				RedirectUri:           redirectUri,
+				Scope:                 test.scope,
+				AuthTime:              time.Now().Unix(),
+				AuthenticationMethods: methods,
+			}
+			if _, err = AddToken(token); err != nil {
+				t.Fatalf("add token: %v", err)
+			}
+
+			result, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(application, application.ClientSecret, token.Code, "", test.requestedRedirect, "")
+			if err != nil {
+				t.Fatalf("exchange returned internal error: %v", err)
+			}
+			if test.wantError == "" {
+				if tokenError != nil || result == nil {
+					t.Fatalf("valid exchange = (%#v, %#v)", result, tokenError)
+				}
+				return
+			}
+			if result != nil || tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, test.wantError) {
+				t.Fatalf("exchange = (%#v, %#v), want invalid_grant containing %q", result, tokenError, test.wantError)
+			}
+			stored, reloadErr := getTokenByCode(token.Code)
+			if reloadErr != nil || stored == nil || stored.CodeIsUsed {
+				t.Fatalf("rejected exchange consumed code: (%#v, %v)", stored, reloadErr)
+			}
+		})
+	}
+}
+
+func TestRefreshAuthenticationContextCannotRemainAAL1AfterMfaEnrollment(t *testing.T) {
+	user := &User{Owner: tokenSecurityOrganization, Name: "alice", Id: tokenSecurityUserID, TotpSecret: "newly-enrolled"}
+	token := &Token{
+		Organization:          user.Owner,
+		User:                  user.Name,
+		Subject:               user.Id,
+		AuthTime:              time.Now().Unix(),
+		AuthenticationMethods: []string{"pwd"},
+	}
+	authenticationContext, err := token.GetAuthenticationContext()
+	if err != nil {
+		t.Fatalf("persisted authentication context: %v", err)
+	}
+	tokenError := validateUserTokenAuthenticationPolicy(user, "openid profile email", authenticationContext)
+	if tokenError == nil || tokenError.Error != InvalidGrant || !strings.Contains(tokenError.ErrorDescription, "multi-factor authentication") {
+		t.Fatalf("refresh policy error = %#v, want MFA reauthentication", tokenError)
 	}
 }
 
