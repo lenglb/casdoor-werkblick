@@ -164,15 +164,20 @@ jobs:
           certificate_identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/werkblick-release.yml@$GITHUB_REF"
           issuer="https://token.actions.githubusercontent.com"
 
-          cosign verify \
+          # Cosign prints the complete attached SPDX document on success. Keep
+          # that large payload out of the Actions log and bound both registry
+          # lookups so a logging or consistency issue cannot occupy the release
+          # runner until the job-level timeout.
+          timeout --signal=TERM --kill-after=15s 5m cosign verify \
             --certificate-identity "$certificate_identity" \
             --certificate-oidc-issuer "$issuer" \
-            "$image_ref"
-          cosign verify-attestation \
+            "$image_ref" >/dev/null
+          timeout --signal=TERM --kill-after=15s 5m cosign verify-attestation \
             --type spdxjson \
             --certificate-identity "$certificate_identity" \
             --certificate-oidc-issuer "$issuer" \
-            "$image_ref"
+            "$image_ref" >/dev/null
+          echo "Verified keyless image signature and signed SPDX SBOM attestation."
 
       - name: Write digest-pinned release summary
         env:
