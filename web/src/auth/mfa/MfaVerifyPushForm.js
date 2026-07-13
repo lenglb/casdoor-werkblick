@@ -1,18 +1,15 @@
-import {Button, Checkbox, Form, Input} from "antd";
+import {Button, Form, Input} from "antd";
 import i18next from "i18next";
 import React from "react";
 import {mfaAuth} from "./MfaVerifyForm";
 
-export const MfaVerifyPushForm = ({mfaProps, application, onFinish, method, user}) => {
+export const MfaVerifyPushForm = ({onFinish, method}) => {
   const [form] = Form.useForm();
   return (
     <Form
       form={form}
       style={{width: "300px", margin: "0 auto"}}
       onFinish={onFinish}
-      initialValues={{
-        enableMfaRemember: false,
-      }}
     >
       {
         method === mfaAuth ? null : (<Form.Item
@@ -35,14 +32,6 @@ export const MfaVerifyPushForm = ({mfaProps, application, onFinish, method, user
           style={{width: "100%", marginTop: 12}}
           placeholder={i18next.t("login:Verification code")}
         />
-      </Form.Item>
-      <Form.Item
-        name="enableMfaRemember"
-        valuePropName="checked"
-      >
-        <Checkbox>
-          {i18next.t("mfa:Remember this account for {hour} hours").replace("{hour}", mfaProps?.mfaRememberInHours)}
-        </Checkbox>
       </Form.Item>
       <Form.Item>
         <Button

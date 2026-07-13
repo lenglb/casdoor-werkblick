@@ -20,6 +20,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 	"time"
 
@@ -27,7 +29,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-const dpopMaxAgeSeconds = 300
+const (
+	dpopMaxAgeSeconds        = 300
+	dpopMaxFutureSkewSeconds = 30
+)
 
 // DPoPProofClaims represents the payload claims of a DPoP proof JWT (RFC 9449).
 type DPoPProofClaims struct {
@@ -49,6 +54,10 @@ type DPoPProofClaims struct {
 // On success it returns the base64url-encoded SHA-256 JWK thumbprint (jkt) of
 // the DPoP public key embedded in the proof header.
 func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, error) {
+	return validateDPoPProofAt(proofToken, method, htu, accessToken, time.Now())
+}
+
+func validateDPoPProofAt(proofToken, method, htu, accessToken string, now time.Time) (string, error) {
 	parts := strings.Split(proofToken, ".")
 	if len(parts) != 3 {
 		return "", fmt.Errorf("invalid DPoP proof JWT format")
@@ -103,8 +112,11 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 	t, err := jwt.ParseWithClaims(proofToken, &DPoPProofClaims{}, func(token *jwt.Token) (interface{}, error) {
 		return jwkKey.Key, nil
 	}, jwt.WithoutClaimsValidation())
-	if err != nil || !t.Valid {
+	if err != nil {
 		return "", fmt.Errorf("DPoP proof signature verification failed: %w", err)
+	}
+	if !t.Valid {
+		return "", fmt.Errorf("DPoP proof signature verification failed")
 	}
 
 	claims, ok := t.Claims.(*DPoPProofClaims)
@@ -113,12 +125,22 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 	}
 
 	// htm MUST match the HTTP request method (RFC 9449 §4.2).
-	if !strings.EqualFold(claims.Htm, method) {
+	if claims.Htm != method {
 		return "", fmt.Errorf("DPoP proof htm %q does not match request method %q", claims.Htm, method)
 	}
 
-	// htu MUST match the request URL without query/fragment (RFC 9449 §4.2).
-	if !strings.EqualFold(claims.Htu, htu) {
+	// Only the URI scheme and host are case-insensitive. Path, escaped path and
+	// query data retain their exact spelling so equivalent-looking request
+	// variants cannot bypass proof replay detection.
+	proofHtu, err := normalizeDPoPTargetURI(claims.Htu)
+	if err != nil {
+		return "", fmt.Errorf("invalid DPoP proof htu: %w", err)
+	}
+	requestHtu, err := normalizeDPoPTargetURI(htu)
+	if err != nil {
+		return "", fmt.Errorf("invalid DPoP request URL: %w", err)
+	}
+	if proofHtu != requestHtu {
 		return "", fmt.Errorf("DPoP proof htu %q does not match request URL %q", claims.Htu, htu)
 	}
 
@@ -126,8 +148,14 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 	if claims.IssuedAt == nil {
 		return "", fmt.Errorf("DPoP proof missing iat claim")
 	}
-	age := time.Since(claims.IssuedAt.Time).Abs()
-	if age > time.Duration(dpopMaxAgeSeconds)*time.Second {
+	issuedAt := claims.IssuedAt.Time
+	maxFutureTime := now.Add(time.Duration(dpopMaxFutureSkewSeconds) * time.Second)
+	if issuedAt.After(maxFutureTime) {
+		return "", fmt.Errorf("DPoP proof iat is more than %d seconds in the future", dpopMaxFutureSkewSeconds)
+	}
+	proofExpiresAt := issuedAt.Add(time.Duration(dpopMaxAgeSeconds) * time.Second)
+	replayTtl := proofExpiresAt.Sub(now)
+	if replayTtl <= 0 {
 		return "", fmt.Errorf("DPoP proof iat is outside the acceptable time window (%d seconds)", dpopMaxAgeSeconds)
 	}
 
@@ -146,7 +174,64 @@ func ValidateDPoPProof(proofToken, method, htu, accessToken string) (string, err
 		}
 	}
 
+	// A proof identity must not depend on request spelling. In particular, host
+	// case or default-port variants must resolve to the same replay marker.
+	replayKeyInput := strings.Join([]string{jkt, claims.Jti}, "\x00")
+	replayKeyHash := sha256.Sum256([]byte(replayKeyInput))
+	replayKey := base64.RawURLEncoding.EncodeToString(replayKeyHash[:])
+	if err = useDPoPProofOnce(replayKey, replayTtl); err != nil {
+		return "", err
+	}
+
 	return jkt, nil
+}
+
+func normalizeDPoPTargetURI(rawUri string) (string, error) {
+	parsedUri, err := url.Parse(rawUri)
+	if err != nil {
+		return "", err
+	}
+	if parsedUri.Opaque != "" || parsedUri.Scheme == "" || parsedUri.Host == "" {
+		return "", fmt.Errorf("target URI must be an absolute hierarchical URI")
+	}
+	if parsedUri.User != nil {
+		return "", fmt.Errorf("target URI must not contain user information")
+	}
+	if parsedUri.Fragment != "" {
+		return "", fmt.Errorf("target URI must not contain a fragment")
+	}
+
+	scheme := strings.ToLower(parsedUri.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", fmt.Errorf("target URI scheme must be http or https")
+	}
+
+	hostname := strings.ToLower(parsedUri.Hostname())
+	if hostname == "" {
+		return "", fmt.Errorf("target URI host must not be empty")
+	}
+	port := parsedUri.Port()
+	if (scheme == "https" && port == "443") || (scheme == "http" && port == "80") {
+		port = ""
+	}
+
+	authority := hostname
+	if port != "" {
+		authority = net.JoinHostPort(hostname, port)
+	} else if strings.Contains(hostname, ":") {
+		authority = "[" + hostname + "]"
+	}
+
+	escapedPath := parsedUri.EscapedPath()
+	if escapedPath == "" {
+		escapedPath = "/"
+	}
+
+	res := scheme + "://" + authority + escapedPath
+	if parsedUri.ForceQuery || parsedUri.RawQuery != "" {
+		res += "?" + parsedUri.RawQuery
+	}
+	return res, nil
 }
 
 // GetDPoPHtu constructs the full DPoP htu URL for a given host and path.

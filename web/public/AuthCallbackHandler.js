@@ -17,6 +17,8 @@
 
   var reactFallbackKey = "__casdoor_callback_react";
   var reactFallbackPayloadKey = "casdoor_callback_react_fallback";
+  var providerStateNoncePattern = /^[a-f0-9]{64}$/;
+  var providerStateStoragePrefix = "casdoor_provider_state_";
 
   function setStatus(message, isError) {
     var statusNode = document.getElementById("callback-status");
@@ -49,9 +51,28 @@
   }
 
   function getQueryParamsFromState(state) {
-    var query = sessionStorage.getItem(state);
+    if (typeof state !== "string" || state.trim() !== state || state === "") {
+      throw new Error("Provider state is missing");
+    }
+
+    var parts = state.split(".");
+    if (parts.length > 2 || !providerStateNoncePattern.test(parts[0])) {
+      throw new Error("Provider state is malformed");
+    }
+    if (parts.length === 2) {
+      if (parts[1] === "") {
+        throw new Error("Provider state payload is missing");
+      }
+      var padded = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+      while (padded.length % 4 !== 0) {
+        padded += "=";
+      }
+      return decodeURIComponent(atob(padded));
+    }
+
+    var query = sessionStorage.getItem(providerStateStoragePrefix + state);
     if (query === null) {
-      return atob(state);
+      throw new Error("Short provider state is not available in this browser session");
     }
     return query;
   }
@@ -158,6 +179,8 @@
       challengeMethod: getRefinedValue(innerParams.get("code_challenge_method")),
       codeChallenge: getRefinedValue(innerParams.get("code_challenge")),
       responseMode: getRefinedValue(innerParams.get("response_mode")),
+      prompt: getRefinedValue(innerParams.get("prompt")),
+      maxAge: getRefinedValue(innerParams.get("max_age")),
       relayState: getRefinedValue(lowercaseQueries["relaystate"]),
       resource: getRefinedValue(innerParams.get("resource")),
       type: "code"
@@ -169,20 +192,29 @@
       return "";
     }
 
-    var resourceQuery = oAuthParams.resource
-      ? "&resource=" + encodeURIComponent(oAuthParams.resource)
-      : "";
+    var params = new URLSearchParams();
+    [
+      ["clientId", oAuthParams.clientId],
+      ["responseType", oAuthParams.responseType],
+      ["redirectUri", oAuthParams.redirectUri],
+      ["type", oAuthParams.type],
+      ["scope", oAuthParams.scope],
+      ["state", oAuthParams.state],
+      ["nonce", oAuthParams.nonce],
+      ["code_challenge_method", oAuthParams.challengeMethod],
+      ["code_challenge", oAuthParams.codeChallenge],
+      ["resource", oAuthParams.resource],
+      ["response_mode", oAuthParams.responseMode],
+      ["prompt", oAuthParams.prompt],
+      ["maxAge", oAuthParams.maxAge]
+    ].forEach(function(entry) {
+      if (entry[1] !== undefined && entry[1] !== null && entry[1] !== "") {
+        params.set(entry[0], String(entry[1]));
+      }
+    });
 
-    return "?clientId=" + oAuthParams.clientId +
-      "&responseType=" + oAuthParams.responseType +
-      "&redirectUri=" + encodeURIComponent(oAuthParams.redirectUri) +
-      "&type=" + oAuthParams.type +
-      "&scope=" + oAuthParams.scope +
-      "&state=" + oAuthParams.state +
-      "&nonce=" + oAuthParams.nonce +
-      "&code_challenge_method=" + oAuthParams.challengeMethod +
-      "&code_challenge=" + oAuthParams.codeChallenge +
-      resourceQuery;
+    var query = params.toString();
+    return query === "" ? "" : "?" + query;
   }
 
   function createFormAndSubmit(action, params) {
@@ -291,7 +323,7 @@
       provider: providerName,
       code: code,
       samlRequest: samlRequest,
-      state: applicationName,
+      state: params.get("state"),
       invitationCode: innerParams.get("invitationCode") || "",
       redirectUri: redirectUri,
       method: method,

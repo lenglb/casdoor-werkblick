@@ -190,6 +190,8 @@ func GetMaskedOrganization(isAdmin bool, organization *Organization, errs ...err
 	if organization == nil {
 		return nil, nil
 	}
+	masked := *organization
+	organization = &masked
 
 	if organization.MasterPassword != "" {
 		organization.MasterPassword = "***"
@@ -200,13 +202,16 @@ func GetMaskedOrganization(isAdmin bool, organization *Organization, errs ...err
 	if organization.MasterVerificationCode != "" {
 		organization.MasterVerificationCode = "***"
 	}
-	if !isAdmin {
-		if organization.PasswordObfuscatorKey != "" {
-			organization.PasswordObfuscatorKey = "***"
-		}
-		if organization.PasswordSalt != "" {
-			organization.PasswordSalt = "***"
-		}
+	if organization.PasswordObfuscatorKey != "" {
+		organization.PasswordObfuscatorKey = "***"
+	}
+	if organization.PasswordSalt != "" {
+		organization.PasswordSalt = "***"
+	}
+	if organization.KerberosKeytab != "" {
+		// A keytab is a credential, not display configuration. It must never be
+		// serialized to browsers, including global-admin and anonymous login APIs.
+		organization.KerberosKeytab = "***"
 	}
 	return organization, nil
 }
@@ -587,16 +592,36 @@ func IsNeedPromptMfa(org *Organization, user *User) bool {
 		mfaItems = user.MfaItems
 	}
 	for _, item := range mfaItems {
-		if item.Rule == "Required" {
-			if item.Name == EmailType && !user.MfaEmailEnabled {
-				return true
-			}
-			if item.Name == SmsType && !user.MfaPhoneEnabled {
-				return true
-			}
-			if item.Name == TotpType && user.TotpSecret == "" {
-				return true
-			}
+		if IsRequiredMfaType(org, user, item.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsRequiredMfaType(org *Organization, user *User, mfaType string) bool {
+	if org == nil || user == nil || mfaType == "" {
+		return false
+	}
+	mfaItems := org.MfaItems
+	if len(user.MfaItems) > 0 {
+		mfaItems = user.MfaItems
+	}
+	for _, item := range mfaItems {
+		if item.Rule != "Required" || item.Name != mfaType {
+			continue
+		}
+		switch mfaType {
+		case EmailType:
+			return !user.MfaEmailEnabled
+		case SmsType:
+			return !user.MfaPhoneEnabled
+		case TotpType:
+			return user.TotpSecret == ""
+		case RadiusType:
+			return !user.MfaRadiusEnabled
+		case PushType:
+			return !user.MfaPushEnabled
 		}
 	}
 	return false

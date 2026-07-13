@@ -76,6 +76,9 @@ class TokenEditPage extends React.Component {
   }
 
   parseAccessToken(accessToken) {
+    if (!accessToken) {
+      return JSON.stringify({credential: "redacted"}, null, 2);
+    }
     try {
       const header = jwtDecode(accessToken, {header: true});
       const payload = jwtDecode(accessToken);
@@ -109,7 +112,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("general:Name"), i18next.t("general:Name - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.name} onChange={e => {
+            <Input disabled value={this.state.token.name} onChange={e => {
               this.updateTokenField("name", e.target.value);
             }} />
           </Col>
@@ -119,7 +122,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("general:Application"), i18next.t("general:Application - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.application} onChange={e => {
+            <Input disabled value={this.state.token.application} onChange={e => {
               this.updateTokenField("application", e.target.value);
             }} />
           </Col>
@@ -129,7 +132,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("general:Organization"), i18next.t("general:Organization - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input disabled={!Setting.isAdminUser(this.props.account)} value={this.state.token.organization} onChange={e => {
+            <Input disabled value={this.state.token.organization} onChange={e => {
               this.updateTokenField("organization", e.target.value);
             }} />
           </Col>
@@ -139,7 +142,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("general:User"), i18next.t("general:User - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.user} onChange={e => {
+            <Input disabled value={this.state.token.user} onChange={e => {
               this.updateTokenField("user", e.target.value);
             }} />
           </Col>
@@ -149,7 +152,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("token:Authorization code"), i18next.t("token:Authorization code - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.code} onChange={e => {
+            <Input disabled placeholder="Credential is not exposed" value={this.state.token.code} onChange={e => {
               this.updateTokenField("code", e.target.value);
             }} />
           </Col>
@@ -169,7 +172,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("provider:Scope"), i18next.t("provider:Scope - Tooltip"))}
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.scope} onChange={e => {
+            <Input disabled value={this.state.token.scope} onChange={e => {
               this.updateTokenField("scope", e.target.value);
             }} />
           </Col>
@@ -179,7 +182,7 @@ class TokenEditPage extends React.Component {
             {Setting.getLabel(i18next.t("token:Token type"), i18next.t("token:Token type - Tooltip"))} :
           </Col>
           <Col span={22} >
-            <Input value={this.state.token.tokenType} onChange={e => {
+            <Input disabled value={this.state.token.tokenType} onChange={e => {
               this.updateTokenField("tokenType", e.target.value);
             }} />
           </Col>
@@ -196,7 +199,7 @@ class TokenEditPage extends React.Component {
             >
               {i18next.t("token:Copy access token")}
             </Button>
-            <TextArea autoSize={{minRows: 10, maxRows: 30}} value={this.state.token.accessToken} onChange={e => {
+            <TextArea disabled placeholder="Credential is not exposed" autoSize={{minRows: 10, maxRows: 30}} value={this.state.token.accessToken} onChange={e => {
               this.updateTokenField("accessToken", e.target.value);
             }} />
           </Col>

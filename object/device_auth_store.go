@@ -27,14 +27,15 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// deviceAuthStore mirrors the sync.Map methods used by the device authorization flow.
-// The default implementation is in-memory; when redisEndpoint is configured, a Redis-backed
-// implementation is used so the flow works correctly across multiple Casdoor replicas.
+// deviceAuthStore provides atomic transient-state operations for the device
+// authorization flow. The default implementation is in-memory; when
+// redisEndpoint is configured, Redis coordinates multiple Casdoor replicas.
 type deviceAuthStore interface {
 	Load(key any) (any, bool)
 	Store(key, value any)
 	Delete(key any)
 	LoadAndDelete(key any) (any, bool)
+	CompareAndSwapStatus(key any, applicationId string, clientId string, oldStatus string, newStatus string) (DeviceAuthCache, bool)
 	Range(f func(key, value any) bool)
 }
 
@@ -51,12 +52,29 @@ func InitDeviceAuthStore() {
 
 	client, err := newRedisClient(endpoint)
 	if err != nil {
-		logs.Warn("device_auth_store: failed to connect to Redis (%s), falling back to in-memory store: %v", endpoint, err)
+		logs.Warn("device_auth_store: failed to connect to Redis (%s), falling back to in-memory store (error type: %T)", sanitizeRedisEndpointForLog(endpoint), err)
 		return
 	}
 
 	DeviceAuthMap = &redisDeviceAuthStore{client: client}
-	logs.Info("device_auth_store: using Redis backend at %s", endpoint)
+	logs.Info("device_auth_store: using Redis backend at %s", sanitizeRedisEndpointForLog(endpoint))
+}
+
+// sanitizeRedisEndpointForLog retains only the address portion of Casdoor's
+// host:port[,db[,password]] Redis setting. It also strips URL-style user info
+// defensively so credentials can never be copied into application logs.
+func sanitizeRedisEndpointForLog(endpoint string) string {
+	address := strings.TrimSpace(endpoint)
+	if separator := strings.Index(address, ","); separator >= 0 {
+		address = strings.TrimSpace(address[:separator])
+	}
+	if userInfo := strings.LastIndex(address, "@"); userInfo >= 0 {
+		address = address[userInfo+1:]
+	}
+	if address == "" {
+		return "configured endpoint"
+	}
+	return address
 }
 
 // newRedisClient parses the same "host:port[,db[,password]]" format that the beego session
@@ -95,14 +113,80 @@ func newRedisClient(endpoint string) (*redis.Client, error) {
 // ── in-memory implementation (default) ──────────────────────────────────────
 
 type memoryDeviceAuthStore struct {
-	m sync.Map
+	mu sync.RWMutex
+	m  map[any]any
 }
 
-func (s *memoryDeviceAuthStore) Load(key any) (any, bool)          { return s.m.Load(key) }
-func (s *memoryDeviceAuthStore) Store(key, value any)              { s.m.Store(key, value) }
-func (s *memoryDeviceAuthStore) Delete(key any)                    { s.m.Delete(key) }
-func (s *memoryDeviceAuthStore) LoadAndDelete(key any) (any, bool) { return s.m.LoadAndDelete(key) }
-func (s *memoryDeviceAuthStore) Range(f func(key, value any) bool) { s.m.Range(f) }
+func (s *memoryDeviceAuthStore) Load(key any) (any, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	value, ok := s.m[key]
+	return value, ok
+}
+
+func (s *memoryDeviceAuthStore) Store(key, value any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.m == nil {
+		s.m = make(map[any]any)
+	}
+	s.m[key] = value
+}
+
+func (s *memoryDeviceAuthStore) Delete(key any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.m, key)
+}
+
+func (s *memoryDeviceAuthStore) LoadAndDelete(key any) (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	value, ok := s.m[key]
+	if ok {
+		delete(s.m, key)
+	}
+	return value, ok
+}
+
+func (s *memoryDeviceAuthStore) CompareAndSwapStatus(key any, applicationId string, clientId string, oldStatus string, newStatus string) (DeviceAuthCache, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	value, ok := s.m[key]
+	if !ok {
+		return DeviceAuthCache{}, false
+	}
+	cache, ok := value.(DeviceAuthCache)
+	if !ok || cache.ApplicationId != applicationId || cache.ClientId != clientId || cache.Status != oldStatus {
+		return DeviceAuthCache{}, false
+	}
+
+	cache.Status = newStatus
+	s.m[key] = cache
+	return cache, true
+}
+
+func (s *memoryDeviceAuthStore) Range(f func(key, value any) bool) {
+	s.mu.RLock()
+	entries := make([]struct {
+		key   any
+		value any
+	}, 0, len(s.m))
+	for key, value := range s.m {
+		entries = append(entries, struct {
+			key   any
+			value any
+		}{key: key, value: value})
+	}
+	s.mu.RUnlock()
+
+	for _, entry := range entries {
+		if !f(entry.key, entry.value) {
+			return
+		}
+	}
+}
 
 // ── Redis implementation ─────────────────────────────────────────────────────
 
@@ -156,7 +240,7 @@ func (s *redisDeviceAuthStore) Store(key, value any) {
 	}
 
 	if err := s.client.Set(context.Background(), rk, data, time.Duration(ttl)*time.Second).Err(); err != nil {
-		logs.Warn("device_auth_store: Redis SET failed for key %s: %v", rk, err)
+		logs.Warn("device_auth_store: Redis SET failed: %v", err)
 	}
 }
 
@@ -167,7 +251,7 @@ func (s *redisDeviceAuthStore) Delete(key any) {
 	}
 
 	if err := s.client.Del(context.Background(), rk).Err(); err != nil {
-		logs.Warn("device_auth_store: Redis DEL failed for key %s: %v", rk, err)
+		logs.Warn("device_auth_store: Redis DEL failed: %v", err)
 	}
 }
 
@@ -188,6 +272,62 @@ func (s *redisDeviceAuthStore) LoadAndDelete(key any) (any, bool) {
 	var cache DeviceAuthCache
 	if err := json.Unmarshal(data, &cache); err != nil {
 		return nil, false
+	}
+	return cache, true
+}
+
+var compareAndSwapDeviceAuthStatusScript = redis.NewScript(`
+local current = redis.call("GET", KEYS[1])
+if not current then
+  return ""
+end
+
+local decoded = cjson.decode(current)
+if decoded.ApplicationId ~= ARGV[1] or decoded.ClientId ~= ARGV[2] or decoded.Status ~= ARGV[3] then
+  return ""
+end
+
+decoded.Status = ARGV[4]
+local updated = cjson.encode(decoded)
+local ttl = redis.call("PTTL", KEYS[1])
+if ttl > 0 then
+  redis.call("SET", KEYS[1], updated, "PX", ttl)
+else
+  redis.call("SET", KEYS[1], updated)
+end
+return updated
+`)
+
+// CompareAndSwapStatus is the cross-replica replay boundary for device-code
+// token issuance. The application and client bindings are checked in the same
+// Redis script as the status transition, and the original expiry is preserved.
+func (s *redisDeviceAuthStore) CompareAndSwapStatus(key any, applicationId string, clientId string, oldStatus string, newStatus string) (DeviceAuthCache, bool) {
+	rk, ok := s.redisKey(key)
+	if !ok {
+		return DeviceAuthCache{}, false
+	}
+
+	result, err := compareAndSwapDeviceAuthStatusScript.Run(
+		context.Background(),
+		s.client,
+		[]string{rk},
+		applicationId,
+		clientId,
+		oldStatus,
+		newStatus,
+	).Result()
+	data, resultIsString := result.(string)
+	if err != nil || !resultIsString || data == "" {
+		if err != nil && err != redis.Nil {
+			logs.Warn("device_auth_store: atomic status transition failed: %v", err)
+		}
+		return DeviceAuthCache{}, false
+	}
+
+	var cache DeviceAuthCache
+	if err = json.Unmarshal([]byte(data), &cache); err != nil {
+		logs.Warn("device_auth_store: failed to decode atomic status transition: %v", err)
+		return DeviceAuthCache{}, false
 	}
 	return cache, true
 }

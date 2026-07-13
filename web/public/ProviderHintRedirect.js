@@ -15,6 +15,9 @@
 (function() {
   "use strict";
 
+  var providerStateNoncePattern = /^[a-f0-9]{64}$/;
+  var providerStateStoragePrefix = "casdoor_provider_state_";
+
   function getFallbackUrl() {
     var url = new URL(window.location.href);
     url.searchParams.delete("provider_hint");
@@ -163,20 +166,26 @@
     Web3Onboard: {scope: "", endpoint: ""}
   };
 
-  function getStateFromQueryParams(applicationName, providerName, method, isShortState) {
+  function encodeProviderStatePayload(query) {
+    return btoa(encodeURIComponent(query)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
+  }
+
+  function getStateFromQueryParams(providerState, applicationName, providerName, method, isShortState) {
+    if (!providerStateNoncePattern.test(providerState)) {
+      throw new Error("A valid server-issued provider state is required");
+    }
     var query = window.location.search;
     query = query + "&application=" + encodeURIComponent(applicationName) + "&provider=" + encodeURIComponent(providerName) + "&method=" + method;
     if (method === "link") {
-      query = query + "&from=" + window.location.pathname;
+      query = query + "&from=" + encodeURIComponent(window.location.pathname);
     }
 
     if (!isShortState) {
-      return btoa(query);
+      return providerState + "." + encodeProviderStatePayload(query);
     }
 
-    var state = providerName;
-    sessionStorage.setItem(state, query);
-    return state;
+    sessionStorage.setItem(providerStateStoragePrefix + providerState, query);
+    return providerState;
   }
 
   async function getAuthUrl(application, provider, method, code) {
@@ -200,12 +209,17 @@
 
     var isTelegramOIDC = provider.type === "Telegram" || (provider.type === "Custom" && provider.customAuthUrl && provider.customAuthUrl.indexOf("oauth.telegram.org") !== -1);
     var isShortState = (provider.type === "WeChat" && navigator.userAgent.indexOf("MicroMessenger") !== -1) || provider.type === "Twitter" || isTelegramOIDC;
+    var normalizedMethod = method || "signup";
+    var providerState = application.providerStates && application.providerStates[provider.name + ":" + normalizedMethod];
+    if (!providerState) {
+      return "";
+    }
     var applicationName = application.name;
     if (application.isShared) {
       applicationName = application.name + "-org-" + application.organization;
     }
 
-    var state = getStateFromQueryParams(applicationName, provider.name, method, isShortState);
+    var state = getStateFromQueryParams(providerState, applicationName, provider.name, normalizedMethod, isShortState);
     var codeVerifier = generateCodeVerifier();
     var codeChallenge = await generateCodeChallenge(codeVerifier);
     storeCodeVerifier(state, codeVerifier);
@@ -309,9 +323,11 @@
     } else if (provider.type === "Bilibili") {
       return endpoint + "#/?client_id=" + provider.clientId + "&return_url=" + redirectUri + "&state=" + state + "&response_type=code";
     } else if (provider.type === "Deezer") {
-      return endpoint + "?app_id=" + provider.clientId + "&redirect_uri=" + redirectUri + "&perms=" + scope;
+      return endpoint + "?app_id=" + provider.clientId + "&redirect_uri=" + redirectUri + "&perms=" + scope + "&state=" + encodeURIComponent(state);
     } else if (provider.type === "Lastfm") {
-      return endpoint + "?api_key=" + provider.clientId + "&cb=" + redirectUri;
+      var lastfmCallback = new URL(redirectUri, window.location.origin);
+      lastfmCallback.searchParams.set("state", state);
+      return endpoint + "?api_key=" + provider.clientId + "&cb=" + encodeURIComponent(lastfmCallback.toString());
     } else if (provider.type === "Shopify") {
       return endpoint + "?client_id=" + provider.clientId + "&redirect_uri=" + redirectUri + "&scope=" + scope + "&state=" + state + "&grant_options[]=per-user";
     } else if (provider.type === "Twitter" || provider.type === "Fitbit") {

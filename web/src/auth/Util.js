@@ -19,6 +19,7 @@ import {getWechatMessageEvent} from "./AuthBackend";
 import * as Setting from "../Setting";
 import * as Provider from "./Provider";
 import * as AuthBackend from "./AuthBackend";
+import {createProviderState, readProviderState} from "./ProviderState.mjs";
 
 export function renderMessage(msg) {
   if (msg !== null) {
@@ -138,6 +139,8 @@ export function getOAuthGetParameters(params) {
   const challengeMethod = getRefinedValue(queries.get("code_challenge_method"));
   const codeChallenge = getRefinedValue(queries.get("code_challenge"));
   const responseMode = getRefinedValue(queries.get("response_mode"));
+  const prompt = getRefinedValue(queries.get("prompt"));
+  const maxAge = getRefinedValue(queries.get("max_age"));
   const samlRequest = getRefinedValue(lowercaseQueries["samlRequest".toLowerCase()]);
   const relayState = getRefinedValue(lowercaseQueries["RelayState".toLowerCase()]);
   const noRedirect = getRefinedValue(lowercaseQueries["noRedirect".toLowerCase()]);
@@ -158,6 +161,8 @@ export function getOAuthGetParameters(params) {
       challengeMethod: challengeMethod,
       codeChallenge: codeChallenge,
       responseMode: responseMode,
+      prompt: prompt,
+      maxAge: maxAge,
       samlRequest: samlRequest,
       relayState: relayState,
       noRedirect: noRedirect,
@@ -167,29 +172,36 @@ export function getOAuthGetParameters(params) {
   }
 }
 
-export function getStateFromQueryParams(applicationName, providerName, method, isShortState) {
-  let query = window.location.search;
-  query = `${query}&application=${encodeURIComponent(applicationName)}&provider=${encodeURIComponent(providerName)}&method=${method}`;
-  if (method === "link") {
-    query = `${query}&from=${window.location.pathname}`;
+export function requiresExplicitOAuthSignin(oAuthParams) {
+  if (!oAuthParams) {
+    return false;
   }
 
-  if (!isShortState) {
-    return btoa(query);
-  } else {
-    const state = providerName;
-    sessionStorage.setItem(state, query);
-    return state;
-  }
+  const prompts = String(oAuthParams.prompt || "").split(/\s+/).filter(Boolean);
+  // If an authorization request with max_age reaches the interactive page, the
+  // server has not completed it through its fresh-session fast path. Require an
+  // explicit credential ceremony for every non-empty representation, including
+  // 0, 00, +0 and positive ages, instead of retrying a stale session.
+  const hasMaxAgeRequirement = String(oAuthParams.maxAge ?? "").trim() !== "";
+  return prompts.includes("login") || prompts.includes("select_account") || hasMaxAgeRequirement;
+}
+
+export function addSearchParamsToUrl(urlValue, values) {
+  const url = new URL(urlValue, window.location.origin);
+  Object.entries(values || {}).forEach(([name, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      url.searchParams.set(name, String(value));
+    }
+  });
+  return url.toString();
+}
+
+export function getStateFromQueryParams(providerState, applicationName, providerName, method, isShortState) {
+  return createProviderState(providerState, applicationName, providerName, method, isShortState, window.location, sessionStorage);
 }
 
 export function getQueryParamsFromState(state) {
-  const query = sessionStorage.getItem(state);
-  if (query === null) {
-    return atob(state);
-  } else {
-    return query;
-  }
+  return readProviderState(state, sessionStorage);
 }
 
 export function getEvent(application, provider, ticket, method) {

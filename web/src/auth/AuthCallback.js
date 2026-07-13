@@ -176,11 +176,11 @@ class AuthCallback extends React.Component {
     return new URLSearchParams(queryString);
   }
 
-  getResponseType() {
+  getResponseType(providedInnerParams = null) {
     // "http://localhost:8000"
     const authServerUrl = authConfig.serverUrl;
 
-    const innerParams = this.getInnerParams();
+    const innerParams = providedInnerParams || this.getInnerParams();
     const method = innerParams.get("method");
     if (method === "signup" || method === "signin") {
       const realRedirectUri = innerParams.get("redirect_uri");
@@ -218,7 +218,16 @@ class AuthCallback extends React.Component {
 
   UNSAFE_componentWillMount() {
     const params = new URLSearchParams(this.props.location.search);
-    const queryString = Util.getQueryParamsFromState(params.get("state"));
+    const returnedState = params.get("state");
+    let queryString;
+    try {
+      queryString = Util.getQueryParamsFromState(returnedState);
+    } catch (error) {
+      this.setState({
+        msg: error instanceof Error ? error.message : "Provider state is invalid",
+      });
+      return;
+    }
     const isSteam = params.get("openid.mode");
     let code = params.get("code");
     // WeCom returns "auth_code=xxx" instead of "code=xxx"
@@ -240,7 +249,8 @@ class AuthCallback extends React.Component {
       code = this.props.location.search;
     }
 
-    const innerParams = this.getInnerParams();
+    const innerParams = new URLSearchParams(queryString);
+    const responseType = this.getResponseType(innerParams);
     const applicationName = innerParams.get("application");
     const providerName = innerParams.get("provider");
     const method = innerParams.get("method");
@@ -283,13 +293,12 @@ class AuthCallback extends React.Component {
     const codeVerifier = Provider.getCodeVerifier(params.get("state"));
 
     const body = {
-      type: this.getResponseType(),
+      type: responseType,
       application: applicationName,
       provider: providerName,
       code: code,
       samlRequest: samlRequest,
-      // state: innerParams.get("state"),
-      state: applicationName,
+      state: returnedState,
       invitationCode: innerParams.get("invitationCode") || "",
       redirectUri: redirectUri,
       method: method,
@@ -307,12 +316,12 @@ class AuthCallback extends React.Component {
         this.handleCasLoginResult(reactFallbackPayload.res, reactFallbackPayload.body || body, reactFallbackPayload.casService || casService);
       } else {
         const fallbackInnerParams = new URLSearchParams(reactFallbackPayload.innerParams || Util.getQueryParamsFromState(params.get("state")));
-        this.handleOAuthLoginResult(reactFallbackPayload.res, reactFallbackPayload.body || body, fallbackInnerParams, reactFallbackPayload.queryString, applicationName, reactFallbackPayload.responseType || this.getResponseType());
+        this.handleOAuthLoginResult(reactFallbackPayload.res, reactFallbackPayload.body || body, fallbackInnerParams, reactFallbackPayload.queryString, applicationName, reactFallbackPayload.responseType || responseType);
       }
       return;
     }
 
-    if (this.getResponseType() === "cas") {
+    if (responseType === "cas") {
       // user is using casdoor as cas sso server, and wants the ticket to be acquired
       AuthBackend.loginCas(body, {"service": casService}).then((res) => {
         if (res.status === "ok") {
@@ -329,7 +338,7 @@ class AuthCallback extends React.Component {
     AuthBackend.login(body, oAuthParams)
       .then((res) => {
         if (res.status === "ok") {
-          this.handleOAuthLoginResult(res, body, innerParams, queryString, applicationName, this.getResponseType());
+          this.handleOAuthLoginResult(res, body, innerParams, queryString, applicationName, responseType);
         } else {
           this.setState({
             msg: res.msg,

@@ -15,7 +15,7 @@
 import React from "react";
 import {DeleteOutlined, DownOutlined, UpOutlined} from "@ant-design/icons";
 import {Button, Col, Row, Select, Table, Tooltip} from "antd";
-import {EmailMfaType, PushMfaType, SmsMfaType, TotpMfaType} from "../auth/MfaSetupPage";
+import {TotpMfaType} from "../auth/MfaSetupPage";
 import {MfaRuleOptional, MfaRulePrompted, MfaRuleRequired} from "../Setting";
 import * as Setting from "../Setting";
 import i18next from "i18next";
@@ -23,10 +23,7 @@ import i18next from "i18next";
 const {Option} = Select;
 
 const MfaItems = [
-  {name: "Phone", value: SmsMfaType},
-  {name: "Email", value: EmailMfaType},
   {name: "App", value: TotpMfaType},
-  {name: "Push", value: PushMfaType},
 ];
 
 const RuleItems = [

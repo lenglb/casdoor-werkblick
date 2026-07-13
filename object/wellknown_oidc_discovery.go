@@ -169,7 +169,7 @@ func GetOidcDiscovery(host string, applicationName string) OidcDiscovery {
 		IdTokenSigningAlgValuesSupported:       []string{"RS256", "RS512", "ES256", "ES384", "ES512"},
 		ScopesSupported:                        scopes,
 		CodeChallengeMethodsSupported:          []string{"S256"},
-		ClaimsSupported:                        []string{"iss", "ver", "sub", "aud", "iat", "exp", "id", "type", "displayName", "avatar", "permanentAvatar", "email", "phone", "location", "affiliation", "title", "homepage", "bio", "tag", "region", "language", "score", "ranking", "isOnline", "isAdmin", "isForbidden", "signupApplication", "ldap"},
+		ClaimsSupported:                        []string{"iss", "ver", "sub", "aud", "iat", "exp", "auth_time", "amr", "acr", "id", "type", "displayName", "avatar", "permanentAvatar", "email", "phone", "location", "affiliation", "title", "homepage", "bio", "tag", "region", "language", "score", "ranking", "isOnline", "isAdmin", "isForbidden", "signupApplication", "ldap"},
 		RequestParameterSupported:              true,
 		RequestObjectSigningAlgValuesSupported: []string{"HS256", "HS384", "HS512"},
 		EndSessionEndpoint:                     fmt.Sprintf("%s/api/logout", originBackend),

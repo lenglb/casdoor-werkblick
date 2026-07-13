@@ -229,6 +229,14 @@ func GetMaskedApplication(application *Application, userId string) *Application 
 		application.FailedSigninFrozenTime = DefaultFailedSigninFrozenTime
 	}
 
+	if application.OrganizationObj != nil {
+		maskedOrganization, err := GetMaskedOrganization(false, application.OrganizationObj)
+		if err != nil {
+			panic(err)
+		}
+		application.OrganizationObj = maskedOrganization
+	}
+
 	isOrgUser := false
 	if userId != "" {
 		if isUserIdGlobalAdmin(userId) {
@@ -281,11 +289,7 @@ func GetMaskedApplication(application *Application, userId string) *Application 
 	application.FailedSigninFrozenTime = -1
 
 	if application.OrganizationObj != nil {
-		application.OrganizationObj.MasterPassword = "***"
-		application.OrganizationObj.DefaultPassword = "***"
-		application.OrganizationObj.MasterVerificationCode = "***"
 		application.OrganizationObj.PasswordType = "***"
-		application.OrganizationObj.PasswordSalt = "***"
 		application.OrganizationObj.InitScore = -1
 		application.OrganizationObj.EnableSoftDeletion = false
 

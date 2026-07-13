@@ -112,6 +112,14 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 	if req.TokenEndpointAuthMethod == "" {
 		req.TokenEndpointAuthMethod = "client_secret_basic"
 	}
+	switch req.TokenEndpointAuthMethod {
+	case "none", "client_secret_basic", "client_secret_post", "private_key_jwt":
+	default:
+		return nil, &DcrError{
+			Error:            "invalid_client_metadata",
+			ErrorDescription: "unsupported token_endpoint_auth_method",
+		}, nil
+	}
 	if req.ApplicationType == "" {
 		req.ApplicationType = "web"
 	}
@@ -145,7 +153,10 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 	// Note: DCR applications are created under "admin" owner by default
 	// This can be made configurable in future versions
 	clientId := util.GenerateClientId()
-	clientSecret := util.GenerateClientSecret()
+	clientSecret := ""
+	if (&Application{TokenEndpointAuthMethod: req.TokenEndpointAuthMethod}).UsesClientSecret() {
+		clientSecret = util.GenerateClientSecret()
+	}
 	registrationAccessToken := util.GenerateClientSecret()
 	createdTime := util.GetCurrentTime()
 
@@ -166,6 +177,7 @@ func RegisterDynamicClient(req *DynamicClientRegistrationRequest, organization s
 		HomepageUrl:             req.ClientUri,
 		ClientId:                clientId,
 		ClientSecret:            clientSecret,
+		TokenEndpointAuthMethod: req.TokenEndpointAuthMethod,
 		RedirectUris:            req.RedirectUris,
 		GrantTypes:              req.GrantTypes,
 		EnablePassword:          true,
@@ -249,7 +261,7 @@ func GetDynamicClientRegistrationResponse(app *Application, registrationClientUr
 		ClientName:              app.DisplayName,
 		RedirectUris:            app.RedirectUris,
 		GrantTypes:              app.GrantTypes,
-		TokenEndpointAuthMethod: "client_secret_basic",
+		TokenEndpointAuthMethod: app.GetTokenEndpointAuthMethod(),
 		ApplicationType:         "web",
 		LogoUri:                 app.Logo,
 		ClientUri:               app.HomepageUrl,
@@ -266,6 +278,19 @@ func UpdateDynamicClient(app *Application, req *DynamicClientRegistrationRequest
 			Error:            "invalid_redirect_uri",
 			ErrorDescription: "redirect_uris is required and must contain at least one URI",
 		}, nil
+	}
+	if req.TokenEndpointAuthMethod != "" {
+		switch req.TokenEndpointAuthMethod {
+		case "none", "client_secret_basic", "client_secret_post", "private_key_jwt":
+		default:
+			return nil, &DcrError{Error: "invalid_client_metadata", ErrorDescription: "unsupported token_endpoint_auth_method"}, nil
+		}
+		app.TokenEndpointAuthMethod = req.TokenEndpointAuthMethod
+		if !app.UsesClientSecret() {
+			app.ClientSecret = ""
+		} else if app.ClientSecret == "" {
+			app.ClientSecret = util.GenerateClientSecret()
+		}
 	}
 
 	app.DisplayName = firstNonEmpty(req.ClientName, app.DisplayName)

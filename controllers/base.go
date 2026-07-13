@@ -112,6 +112,13 @@ func (c *ApiController) GetSessionUsername() string {
 			return username
 		}
 	}
+	// Access-token authentication is request-scoped so a Bearer or DPoP proof
+	// cannot silently become a cookie-authenticated browser session.
+	if tokenUser := c.Ctx.Input.GetData("tokenAuthenticatedUserId"); tokenUser != nil {
+		if username, ok := tokenUser.(string); ok {
+			return username
+		}
+	}
 
 	// check if user session expired
 	sessionData := c.GetSessionData()
@@ -152,6 +159,11 @@ func (c *ApiController) GetPaidUsername() string {
 }
 
 func (c *ApiController) GetSessionToken() string {
+	if value := c.Ctx.Input.GetData("tokenAuthenticatedAccessToken"); value != nil {
+		if accessToken, ok := value.(string); ok {
+			return accessToken
+		}
+	}
 	accessToken := c.GetSession("accessToken")
 	if accessToken == nil {
 		return ""
@@ -177,6 +189,15 @@ func (c *ApiController) GetSessionApplication() *object.Application {
 func (c *ApiController) ClearUserSession() {
 	c.SetSessionUsername("")
 	c.SetSessionData(nil)
+	_ = c.DelSession("paidUsername")
+	_ = c.DelSession("scope")
+	_ = c.DelSession("aud")
+	_ = c.DelSession("impersonateUser")
+	_ = c.DelSession("verificationCodeType")
+	_ = c.clearMfaSetupSession()
+	_ = c.setMfaUserSession("")
+	c.clearCurrentAuthenticationContext()
+	c.clearPendingAuthentication()
 	_ = c.SessionRegenerateID()
 }
 
@@ -185,6 +206,11 @@ func (c *ApiController) ClearTokenSession() {
 }
 
 func (c *ApiController) GetSessionOidc() (string, string) {
+	requestScope, scopeOk := c.Ctx.Input.GetData("tokenAuthenticatedScope").(string)
+	requestAud, audOk := c.Ctx.Input.GetData("tokenAuthenticatedAud").(string)
+	if scopeOk || audOk {
+		return requestScope, requestAud
+	}
 	sessionData := c.GetSessionData()
 	if sessionData != nil &&
 		sessionData.ExpireTime != 0 &&
@@ -241,8 +267,28 @@ func (c *ApiController) SetSessionData(s *SessionData) {
 	c.SetSession("SessionData", util.StructToJson(s))
 }
 
-func (c *ApiController) setMfaUserSession(userId string) {
-	c.SetSession(object.MfaSessionUserId, userId)
+func (c *ApiController) setMfaUserSession(userId string) error {
+	return c.SetSession(object.MfaSessionUserId, userId)
+}
+
+func (c *ApiController) setMfaSetupUserSession(userId string) error {
+	return c.SetSession(object.MfaSetupSessionUserId, userId)
+}
+
+func (c *ApiController) getMfaSetupUserSession() string {
+	value := c.GetSession(object.MfaSetupSessionUserId)
+	userId, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return userId
+}
+
+func (c *ApiController) clearMfaSetupSession() error {
+	if err := c.DelSession(object.MfaSetupSessionUserId); err != nil {
+		return err
+	}
+	return c.DelSession(object.MfaSetupTransaction)
 }
 
 func (c *ApiController) getMfaUserSession() string {

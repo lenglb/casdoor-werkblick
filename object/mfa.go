@@ -16,9 +16,37 @@ package object
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/casdoor/casdoor/util"
 )
+
+func ValidateHardenedMfaItems(items []*MfaItem) error {
+	seen := map[string]struct{}{}
+	requiredCount := 0
+	for _, item := range items {
+		if item == nil {
+			return fmt.Errorf("MFA policy must not contain an empty item")
+		}
+		if item.Name != TotpType {
+			return fmt.Errorf("MFA policy type %q is not rollout-safe; only TOTP is supported", item.Name)
+		}
+		if !slices.Contains([]string{"Optional", "Prompted", "Required"}, item.Rule) {
+			return fmt.Errorf("MFA policy rule %q is invalid", item.Rule)
+		}
+		if _, ok := seen[item.Name]; ok {
+			return fmt.Errorf("MFA policy type %q is duplicated", item.Name)
+		}
+		seen[item.Name] = struct{}{}
+		if item.Rule == "Required" {
+			requiredCount++
+		}
+	}
+	if requiredCount > 1 {
+		return fmt.Errorf("MFA policy can require at most one factor")
+	}
+	return nil
+}
 
 type MfaProps struct {
 	Enabled            bool     `json:"enabled"`
@@ -47,9 +75,11 @@ const (
 )
 
 const (
-	MfaSessionUserId = "MfaSessionUserId"
-	NextMfa          = "NextMfa"
-	RequiredMfa      = "RequiredMfa"
+	MfaSessionUserId      = "MfaSessionUserId"
+	MfaSetupSessionUserId = "MfaSetupSessionUserId"
+	MfaSetupTransaction   = "MfaSetupTransaction"
+	NextMfa               = "NextMfa"
+	RequiredMfa           = "RequiredMfa"
 )
 
 func GetMfaUtil(mfaType string, config *MfaProps) MfaInterface {
@@ -224,6 +254,13 @@ func DisabledMultiFactorAuth(user *User) error {
 }
 
 func SetPreferredMultiFactorAuth(user *User, mfaType string) error {
+	if user == nil {
+		return fmt.Errorf("MFA user must not be nil")
+	}
+	props := user.GetMfaProps(mfaType, false)
+	if mfaType == "" || props == nil || !props.Enabled {
+		return fmt.Errorf("preferred MFA type must be a valid enabled factor")
+	}
 	user.PreferredMfaType = mfaType
 
 	_, err := UpdateUser(user.GetId(), user, []string{"preferred_mfa_type"}, false)

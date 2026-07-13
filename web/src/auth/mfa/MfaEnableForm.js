@@ -3,6 +3,22 @@ import i18next from "i18next";
 import React, {useState} from "react";
 import * as MfaBackend from "../../backend/MfaBackend";
 
+export function getMfaSetupCompletion(res) {
+  const completion = res?.data;
+  if (completion === null || typeof completion !== "object" || Array.isArray(completion)) {
+    return {type: "", redirectUrl: ""};
+  }
+
+  return {
+    type: typeof completion.type === "string" ? completion.type : "",
+    redirectUrl: typeof completion.redirectUrl === "string" ? completion.redirectUrl : "",
+    redirectUri: typeof completion.redirectUri === "string" ? completion.redirectUri : "",
+    responseMode: typeof completion.responseMode === "string" ? completion.responseMode : "",
+    code: typeof completion.code === "string" ? completion.code : "",
+    state: typeof completion.state === "string" ? completion.state : "",
+  };
+}
+
 export function MfaEnableForm({user, mfaType, secret, recoveryCodes, dest, countryCode, onSuccess, onFail}) {
   const [loading, setLoading] = useState(false);
   const requestEnableMfa = () => {
@@ -17,7 +33,7 @@ export function MfaEnableForm({user, mfaType, secret, recoveryCodes, dest, count
     setLoading(true);
     MfaBackend.MfaSetupEnable(data).then(res => {
       if (res.status === "ok") {
-        onSuccess(res);
+        onSuccess(res, getMfaSetupCompletion(res));
       } else {
         onFail(res);
       }

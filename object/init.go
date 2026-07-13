@@ -17,7 +17,6 @@ package object
 import (
 	"encoding/gob"
 	"fmt"
-	"os"
 
 	"github.com/casdoor/casdoor/conf"
 	"github.com/casdoor/casdoor/util"
@@ -252,22 +251,7 @@ func initBuiltInApplication() {
 	}
 }
 
-func readTokenFromFile() (string, string) {
-	pemPath := "./object/token_jwt_key.pem"
-	keyPath := "./object/token_jwt_key.key"
-	pem, err := os.ReadFile(pemPath)
-	if err != nil {
-		return "", ""
-	}
-	key, err := os.ReadFile(keyPath)
-	if err != nil {
-		return "", ""
-	}
-	return string(pem), string(key)
-}
-
 func initBuiltInCert() {
-	tokenJwtCertificate, tokenJwtPrivateKey := readTokenFromFile()
 	cert, err := getCert("admin", "cert-built-in")
 	if err != nil {
 		panic(err)
@@ -275,6 +259,14 @@ func initBuiltInCert() {
 
 	if cert != nil {
 		return
+	}
+
+	// Every fresh installation must have its own signing key. The upstream
+	// repository historically shipped one static private key, which made tokens
+	// from every unrotated deployment forgeable by anyone with the source tree.
+	tokenJwtCertificate, tokenJwtPrivateKey, err := generateRsaKeys(4096, 256, 20, "cert-built-in", "admin")
+	if err != nil {
+		panic(err)
 	}
 
 	cert = &Cert{

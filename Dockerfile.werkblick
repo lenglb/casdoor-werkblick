@@ -1,0 +1,91 @@
+# syntax=docker/dockerfile:1.7
+
+# Build images are pinned to immutable multi-architecture index digests. Update
+# the version and digest together, then review the upstream image changelog.
+FROM --platform=$BUILDPLATFORM node:20.20.1@sha256:e391c5561646193be929e3fe55d27234f40a01d867d72b30ae1341b673a3bf4b AS frontend
+
+WORKDIR /src/web
+
+COPY web/package.json web/yarn.lock ./
+RUN --mount=type=cache,target=/usr/local/share/.cache/yarn,sharing=locked \
+    test "$(yarn --version)" = "1.22.22" \
+    && yarn install --frozen-lockfile --network-timeout 1000000
+
+COPY web/ ./
+
+ARG SOURCE_DATE_EPOCH=0
+ENV CI=false \
+    GENERATE_SOURCEMAP=false
+
+RUN NODE_OPTIONS="--max-old-space-size=4096" yarn run build \
+    && find build -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+
+FROM --platform=$BUILDPLATFORM golang:1.25.8-bookworm@sha256:4557cf171e3cdf5053a298d5171b1a5f5734d920260c25f22c79e94760eb2084 AS backend
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    test "$(go env GOVERSION)" = "go1.25.8" \
+    && go mod download \
+    && go mod verify
+
+COPY . ./
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG SOURCE_DATE_EPOCH=0
+
+RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
+    --mount=type=cache,target=/root/.cache/go-build,sharing=locked \
+    mkdir -p /out/root \
+    && CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-amd64}" \
+      go build \
+        -trimpath \
+        -buildvcs=false \
+        -tags=netgo,osusergo \
+        -ldflags="-s -w -buildid=" \
+        -o /out/root/server \
+        .
+
+# Only explicitly selected runtime assets cross the build boundary. Casdoor
+# configuration and key material must be mounted at runtime, never baked in.
+RUN mkdir -p \
+      /out/root/conf \
+      /out/root/files \
+      /out/root/logs \
+      /out/root/temp \
+      /out/root/tmp \
+      /out/root/swagger \
+    && cp -a swagger/. /out/root/swagger/ \
+    && chmod 0555 /out/root/server /out/root/conf /out/root/swagger \
+    && chmod 0750 /out/root/files /out/root/logs /out/root/temp /out/root/tmp \
+    && find /out/root -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+COPY --from=frontend /src/web/build /out/root/web/build
+RUN chmod -R a-w /out/root/web \
+    && find /out/root/web -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
+
+
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:b7bb25d9f7c31d2bdd1982feb4dafcaf137703c7075dbe2febb41c24212b946f AS runtime
+
+LABEL org.opencontainers.image.title="Werkblick Casdoor" \
+      org.opencontainers.image.description="Hardened Werkblick identity provider based on Casdoor" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+WORKDIR /
+
+COPY --from=backend --chown=65532:65532 /out/root/ /
+
+ENV HOME=/tmp \
+    TMPDIR=/tmp
+
+USER 65532:65532
+
+EXPOSE 8000 389 1812/udp
+STOPSIGNAL SIGTERM
+
+# /conf/app.conf is intentionally absent. Mount it read-only at runtime and
+# source every credential from the deployment's secret store (1Password).
+ENTRYPOINT ["/server"]

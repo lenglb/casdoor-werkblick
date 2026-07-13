@@ -63,6 +63,39 @@ type Captcha struct {
 	SubType       string `json:"subType"`
 }
 
+// restrictedMfaOrganization is the complete organization surface available
+// between primary authentication and required MFA enrollment. Keep this an
+// explicit allowlist: the full Organization model contains credentials such
+// as password keys and a Kerberos keytab.
+type restrictedMfaOrganization struct {
+	Owner        string            `json:"owner"`
+	Name         string            `json:"name"`
+	DisplayName  string            `json:"displayName"`
+	Logo         string            `json:"logo"`
+	LogoDark     string            `json:"logoDark"`
+	Favicon      string            `json:"favicon"`
+	ThemeData    *object.ThemeData `json:"themeData"`
+	CountryCodes []string          `json:"countryCodes"`
+	MfaItems     []*object.MfaItem `json:"mfaItems"`
+}
+
+func getRestrictedMfaOrganization(organization *object.Organization) *restrictedMfaOrganization {
+	if organization == nil {
+		return nil
+	}
+	return &restrictedMfaOrganization{
+		Owner:        organization.Owner,
+		Name:         organization.Name,
+		DisplayName:  organization.DisplayName,
+		Logo:         organization.Logo,
+		LogoDark:     organization.LogoDark,
+		Favicon:      organization.Favicon,
+		ThemeData:    organization.ThemeData,
+		CountryCodes: append([]string(nil), organization.CountryCodes...),
+		MfaItems:     append([]*object.MfaItem(nil), organization.MfaItems...),
+	}
+}
+
 // this API is used by "Api URL" of Flarum's FoF Passport plugin
 // https://github.com/FriendsOfFlarum/passport
 type LaravelResponse struct {
@@ -346,34 +379,44 @@ func (c *ApiController) Signup() {
 	util.LogInfo(c.Ctx, "API: [%s] is signed up as new user", userId)
 
 	// Check if this is an OAuth flow and automatically generate code
-	clientId := c.Ctx.Input.Query("clientId")
 	responseType := c.Ctx.Input.Query("responseType")
-	redirectUri := c.Ctx.Input.Query("redirectUri")
-	scope := c.Ctx.Input.Query("scope")
-	state := c.Ctx.Input.Query("state")
-	nonce := c.Ctx.Input.Query("nonce")
-	codeChallenge := c.Ctx.Input.Query("code_challenge")
 
 	// If OAuth parameters are present, generate OAuth code and return it
-	if clientId != "" && responseType == ResponseTypeCode {
-		consentRequired, err := object.CheckConsentRequired(user, application, scope)
+	if c.Ctx.Input.Query("clientId") != "" && responseType == ResponseTypeCode {
+		authenticationMethods := []string{}
+		verificationType := ""
+		if application.IsSignupItemVisible("Password") && authForm.Password != "" {
+			authenticationMethods = append(authenticationMethods, "pwd")
+		}
+		if userEmailVerified {
+			authenticationMethods = append(authenticationMethods, "email")
+			verificationType = "email"
+		}
+		if checkPhone != "" {
+			authenticationMethods = append(authenticationMethods, "sms")
+			if verificationType == "" {
+				verificationType = "sms"
+			}
+		}
+		if len(authenticationMethods) == 0 {
+			c.ResponseError("fresh authentication is required before OAuth authorization")
+			return
+		}
+
+		authenticationContext, err := c.beginAuthentication(user, authenticationMethods, "", ResponseTypeCode, application, authForm.UserCode)
 		if err != nil {
 			c.ResponseError(err.Error())
 			return
 		}
-
-		if consentRequired {
-			c.ResponseOk(map[string]bool{"required": true})
+		if checkMfaEnable(c, user, organization, verificationType) {
 			return
 		}
-
-		code, err := object.GetOAuthCode(userId, clientId, "", "password", responseType, redirectUri, scope, state, nonce, codeChallenge, "", c.Ctx.Request.Host, c.GetAcceptLanguage())
-		if err != nil {
-			c.ResponseError(err.Error(), nil)
+		if err = c.completeAuthentication(authenticationContext); err != nil {
+			c.ResponseError(err.Error())
 			return
 		}
-
-		resp := codeToResponse(code)
+		authForm.Type = ResponseTypeCode
+		resp := c.HandleLoggedIn(application, user, &authForm)
 		c.Data["json"] = resp
 		c.ServeJSON()
 		return
@@ -400,6 +443,9 @@ func (c *ApiController) Logout() {
 	state := c.GetString("state")
 
 	user := c.GetSessionUsername()
+	continuationSession := c.GetSession(object.MfaSetupSessionUserId) != nil ||
+		c.GetSession(object.MfaSessionUserId) != nil ||
+		c.GetSession(object.PendingAuthenticationSessionKey) != nil
 
 	if accessToken == "" {
 		// "id_token_hint" is only RECOMMENDED (not REQUIRED) by the OIDC RP-Initiated Logout
@@ -407,6 +453,12 @@ func (c *ApiController) Logout() {
 		// clients (e.g. Gitea) only send "post_logout_redirect_uri" (optionally with
 		// "client_id"), see: https://github.com/casdoor/casdoor/issues/5607
 		// TODO https://github.com/casdoor/casdoor/pull/1494#discussion_r1095675265
+		if user == "" && continuationSession {
+			c.ClearUserSession()
+			c.ClearTokenSession()
+			c.ResponseOk()
+			return
+		}
 		if user == "" {
 			c.ResponseOk()
 			return
@@ -641,6 +693,10 @@ func (c *ApiController) GetAccount() {
 	if err != nil {
 		logs.Error("AppendWebConfigCookie failed in GetAccount, error: %s", err)
 	}
+	if c.GetSessionUsername() == "" && c.getMfaSetupUserSession() != "" {
+		c.getRestrictedMfaSetupAccount()
+		return
+	}
 
 	user, ok := c.RequireSignedInUser()
 	if !ok {
@@ -688,7 +744,12 @@ func (c *ApiController) GetAccount() {
 
 	accessToken := c.GetSessionToken()
 	if accessToken == "" {
-		accessToken, err = object.GetAccessTokenByUser(user, c.Ctx.Request.Host)
+		authenticationContext, contextErr := c.getCurrentAuthenticationContext()
+		if contextErr != nil || authenticationContext.Subject != user.GetId() {
+			c.ResponseError("fresh authentication is required before issuing an account access token")
+			return
+		}
+		accessToken, err = object.GetAccessTokenByUser(user, c.Ctx.Request.Host, authenticationContext)
 		if err != nil {
 			c.ResponseError(err.Error())
 			return
@@ -705,6 +766,58 @@ func (c *ApiController) GetAccount() {
 		Data2:  organization,
 	}
 	c.Data["json"] = resp
+	c.ServeJSON()
+}
+
+func (c *ApiController) getRestrictedMfaSetupAccount() {
+	userId := c.getMfaSetupUserSession()
+	pending, err := c.getPendingAuthentication()
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if pending.Context.Subject != userId {
+		c.ResponseError("pending authentication does not match the MFA setup user")
+		return
+	}
+	user, err := object.GetUser(userId)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if user == nil {
+		_ = c.clearMfaSetupSession()
+		c.ResponseError("MFA setup user does not exist")
+		return
+	}
+	user.MultiFactorAuths = object.GetAllMfaProps(user, true)
+	user.Roles = nil
+	user.Permissions = nil
+	user.ManagedAccounts = nil
+	user.Properties = map[string]string{}
+	maskedUser, err := object.GetMaskedUser(user, false)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	maskedUser.AccessToken = ""
+
+	organization, err := object.GetOrganizationByUser(user)
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	c.Data["json"] = Response{
+		Status: "ok",
+		Sub:    user.Id,
+		Name:   user.Name,
+		Data:   maskedUser,
+		Data2:  getRestrictedMfaOrganization(organization),
+		Data3: map[string]string{
+			"mode":          "mfa_setup",
+			"applicationId": pending.ApplicationId,
+		},
+	}
 	c.ServeJSON()
 }
 

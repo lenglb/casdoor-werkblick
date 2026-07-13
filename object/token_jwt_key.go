@@ -45,12 +45,16 @@ func generateRsaKeys(bitSize int, shaSize int, expireInYears int, commonName str
 		},
 	)
 
+	serialNumber, err := randomCertificateSerialNumber()
+	if err != nil {
+		return "", "", err
+	}
 	tml := x509.Certificate{
 		// you can add any attr that you need
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().AddDate(expireInYears, 0, 0),
 		// you have to generate a different serial number each execution
-		SerialNumber: big.NewInt(123456),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   commonName,
 			Organization: []string{organization},
@@ -113,10 +117,14 @@ func generateEsKeys(shaSize int, expireInYears int, commonName string, organizat
 	})
 
 	// Generate certificate template.
+	serialNumber, err := randomCertificateSerialNumber()
+	if err != nil {
+		return "", "", err
+	}
 	template := x509.Certificate{
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().AddDate(expireInYears, 0, 0),
-		SerialNumber: big.NewInt(time.Now().Unix()),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   commonName,
 			Organization: []string{organization},
@@ -159,12 +167,16 @@ func generateRsaPssKeys(bitSize int, shaSize int, expireInYears int, commonName 
 		},
 	)
 
+	serialNumber, err := randomCertificateSerialNumber()
+	if err != nil {
+		return "", "", err
+	}
 	tml := x509.Certificate{
 		// you can add any attr that you need
 		NotBefore: time.Now(),
 		NotAfter:  time.Now().AddDate(expireInYears, 0, 0),
 		// you have to generate a different serial number each execution
-		SerialNumber: big.NewInt(123456),
+		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   commonName,
 			Organization: []string{organization},
@@ -196,4 +208,16 @@ func generateRsaPssKeys(bitSize int, shaSize int, expireInYears int, commonName 
 	})
 
 	return string(certPem), string(privateKeyPem), nil
+}
+
+func randomCertificateSerialNumber() (*big.Int, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, limit)
+	if err != nil {
+		return nil, fmt.Errorf("generate certificate serial number: %w", err)
+	}
+	if serialNumber.Sign() == 0 {
+		serialNumber.SetInt64(1)
+	}
+	return serialNumber, nil
 }

@@ -846,11 +846,28 @@ class ApplicationEditPage extends React.Component {
               {Setting.getLabel(i18next.t("application:Token fields"), i18next.t("application:Token fields - Tooltip"))} :
             </Col>
             <Col span={21} >
-              <Select virtual={false} disabled={this.state.application.tokenFormat !== "JWT-Custom"} mode="tags" showSearch style={{width: "100%"}} value={this.state.application.tokenFields} onChange={(value => {this.updateApplicationField("tokenFields", value);})}>
+              <Select
+                virtual={false}
+                disabled={this.state.application.tokenFormat !== "JWT-Custom"}
+                mode="tags"
+                showSearch
+                style={{width: "100%"}}
+                status={(this.state.application.tokenFields || []).some((field) => !Setting.isSafeJwtTokenField(field)) ? "error" : undefined}
+                value={this.state.application.tokenFields}
+                onChange={(value) => {
+                  const currentFields = this.state.application.tokenFields || [];
+                  const rejectedFields = value.filter((field) => !Setting.isSafeJwtTokenField(field) && !currentFields.includes(field));
+                  if (rejectedFields.length > 0) {
+                    Setting.showMessage("error", `Unsupported JWT token field: ${rejectedFields.join(", ")}`);
+                  }
+                  const acceptedFields = value.filter((field) => Setting.isSafeJwtTokenField(field) || currentFields.includes(field));
+                  this.updateApplicationField("tokenFields", acceptedFields);
+                }}
+              >
                 <Option key={"signinMethod"} value={"signinMethod"}>{"SigninMethod"}</Option>
                 <Option key={"provider"} value={"provider"}>{"Provider"}</Option>
                 {
-                  [...Setting.getUserCommonFields(), "permissionNames"].map((item, index) => <Option key={index} value={item}>{item}</Option>)
+                  Setting.getJwtTokenFields().map((item, index) => <Option key={index} value={item}>{item}</Option>)
                 }
               </Select>
             </Col>
@@ -1790,6 +1807,11 @@ class ApplicationEditPage extends React.Component {
     application.customScopes = customScopeValidation.scopes;
     if (!customScopeValidation.ok) {
       Setting.showMessage("error", `${i18next.t("general:Name")}: ${i18next.t("provider:This field is required")}`);
+      return;
+    }
+    const jwtTokenValidation = Setting.validateJwtTokenConfiguration(application);
+    if (!jwtTokenValidation.ok) {
+      Setting.showMessage("error", `${i18next.t("general:Failed to save")}: ${jwtTokenValidation.issues.join("; ")}`);
       return;
     }
 

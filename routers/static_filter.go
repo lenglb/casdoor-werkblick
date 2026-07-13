@@ -16,12 +16,16 @@ package routers
 
 import (
 	"compress/gzip"
+	stdcontext "context"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -65,32 +69,138 @@ func getWebBuildFolder() string {
 	return path
 }
 
+func pendingAuthenticationBlocksAutoSignin(ctx *context.Context) (bool, error) {
+	value := ctx.Input.CruSession.Get(stdcontext.Background(), object.PendingAuthenticationSessionKey)
+	if value == nil {
+		return false, nil
+	}
+
+	serialized, ok := value.(string)
+	if ok && strings.TrimSpace(serialized) != "" {
+		var pending object.PendingAuthentication
+		if err := util.JsonToStruct(serialized, &pending); err == nil {
+			if _, err = pending.Preserve(); err == nil {
+				return true, nil
+			}
+		}
+	}
+
+	if err := ctx.Input.CruSession.Delete(stdcontext.Background(), object.PendingAuthenticationSessionKey); err != nil {
+		return true, fmt.Errorf("clear invalid pending authentication: %w", err)
+	}
+	ctx.Input.CruSession.SessionRelease(stdcontext.Background(), ctx.ResponseWriter)
+	// Fail closed for this request even though the invalid or expired state has
+	// been removed. A following authorization request may use auto sign-in.
+	return true, nil
+}
+
 func fastAutoSignin(ctx *context.Context) (string, error) {
-	userId := getSessionUser(ctx)
-	if userId == "" {
+	request := object.AuthorizationRequest{
+		ClientId:        ctx.Input.Query("client_id"),
+		ResponseType:    ctx.Input.Query("response_type"),
+		RedirectUri:     ctx.Input.Query("redirect_uri"),
+		Scope:           ctx.Input.Query("scope"),
+		State:           ctx.Input.Query("state"),
+		Nonce:           ctx.Input.Query("nonce"),
+		ChallengeMethod: ctx.Input.Query("code_challenge_method"),
+		CodeChallenge:   ctx.Input.Query("code_challenge"),
+		Resource:        ctx.Input.Query("resource"),
+		Prompt:          ctx.Input.Query("prompt"),
+	}
+	if maxAgeValue := ctx.Input.Query("max_age"); maxAgeValue != "" {
+		maxAge, err := strconv.ParseInt(maxAgeValue, 10, 64)
+		if err != nil {
+			return "", fmt.Errorf("max_age must be an integer")
+		}
+		request.MaxAge = &maxAge
+	}
+	if request.ClientId == "" || request.ResponseType != "code" || request.RedirectUri == "" {
 		return "", nil
 	}
-
-	clientId := ctx.Input.Query("client_id")
-	responseType := ctx.Input.Query("response_type")
-	redirectUri := ctx.Input.Query("redirect_uri")
-	scope := ctx.Input.Query("scope")
-	state := ctx.Input.Query("state")
-	nonce := ctx.Input.Query("nonce")
-	codeChallenge := ctx.Input.Query("code_challenge")
-	if clientId == "" || responseType != "code" || redirectUri == "" {
-		return "", nil
+	if err := request.Validate(); err != nil {
+		return "", err
 	}
 
-	application, err := object.GetApplicationByClientId(clientId)
+	application, err := object.GetApplicationByClientId(request.ClientId)
 	if err != nil {
 		return "", err
 	}
 	if application == nil {
 		return "", nil
 	}
+	if !application.IsRedirectUriValid(request.RedirectUri) {
+		return "", fmt.Errorf("redirect_uri is not registered for the OAuth client")
+	}
+	if !object.IsScopeValid(request.Scope, application) {
+		return "", fmt.Errorf("invalid OAuth scope")
+	}
+	prompts, err := request.PromptValues()
+	if err != nil {
+		return "", err
+	}
+	promptNone := slices.Contains(prompts, "none")
+	requireInteraction := func(errorCode string) (string, error) {
+		if promptNone {
+			return oauthErrorRedirect(request, errorCode), nil
+		}
+		return "", nil
+	}
 
 	if !application.EnableAutoSignin {
+		return requireInteraction("login_required")
+	}
+
+	userId := getSessionUser(ctx)
+	if userId == "" {
+		return requireInteraction("login_required")
+	}
+	pendingBlocks, pendingErr := pendingAuthenticationBlocksAutoSignin(ctx)
+	if pendingErr != nil {
+		return "", pendingErr
+	}
+	if pendingBlocks {
+		return requireInteraction("login_required")
+	}
+	if mfaUser := ctx.Input.CruSession.Get(stdcontext.Background(), object.MfaSessionUserId); mfaUser != nil {
+		if value, ok := mfaUser.(string); !ok || value != "" {
+			return requireInteraction("login_required")
+		}
+	}
+
+	if sessionDataValue := ctx.Input.CruSession.Get(stdcontext.Background(), "SessionData"); sessionDataValue != nil {
+		serializedSessionData, ok := sessionDataValue.(string)
+		if !ok {
+			return requireInteraction("login_required")
+		}
+		var sessionData struct {
+			ExpireTime int64
+		}
+		if err = util.JsonToStruct(serializedSessionData, &sessionData); err != nil ||
+			(sessionData.ExpireTime != 0 && sessionData.ExpireTime < time.Now().Unix()) {
+			return requireInteraction("login_required")
+		}
+	}
+
+	authenticationContextValue := ctx.Input.CruSession.Get(stdcontext.Background(), object.CurrentAuthenticationContextSessionKey)
+	if authenticationContextValue == nil {
+		return requireInteraction("login_required")
+	}
+	serializedAuthenticationContext, ok := authenticationContextValue.(string)
+	if !ok {
+		return requireInteraction("login_required")
+	}
+	var authenticationContext object.AuthenticationContext
+	if err = util.JsonToStruct(serializedAuthenticationContext, &authenticationContext); err != nil {
+		return requireInteraction("login_required")
+	}
+	authenticationContext, err = object.PreserveAuthenticationContext(authenticationContext)
+	if err != nil || authenticationContext.Subject != userId {
+		return requireInteraction("login_required")
+	}
+	if request.RequiresFreshAuthentication(authenticationContext, time.Now().Unix()) {
+		return requireInteraction("login_required")
+	}
+	if slices.Contains(prompts, "consent") {
 		return "", nil
 	}
 
@@ -100,7 +210,7 @@ func fastAutoSignin(ctx *context.Context) (string, error) {
 	}
 
 	if !isAllowed {
-		return "", nil
+		return requireInteraction("access_denied")
 	}
 
 	user, err := object.GetUser(userId)
@@ -108,31 +218,69 @@ func fastAutoSignin(ctx *context.Context) (string, error) {
 		return "", err
 	}
 	if user == nil {
-		return "", nil
+		return requireInteraction("login_required")
 	}
 
-	consentRequired, err := object.CheckConsentRequired(user, application, scope)
+	consentRequired, err := object.CheckConsentRequired(user, application, request.Scope)
 	if err != nil {
 		return "", err
 	}
 
 	if consentRequired {
-		return "", nil
+		return requireInteraction("consent_required")
 	}
 
-	code, err := object.GetOAuthCode(userId, clientId, "", "autoSignin", responseType, redirectUri, scope, state, nonce, codeChallenge, "", ctx.Request.Host, getAcceptLanguage(ctx))
+	code, err := object.GetOAuthCodeWithAuthenticationContext(
+		userId,
+		request.ClientId,
+		authenticationContext,
+		request.ResponseType,
+		request.RedirectUri,
+		request.Scope,
+		request.State,
+		request.Nonce,
+		request.CodeChallenge,
+		request.Resource,
+		ctx.Request.Host,
+		getAcceptLanguage(ctx),
+	)
 	if err != nil {
 		return "", err
+	} else if code == nil {
+		return "", errors.New("failed to create OAuth authorization code")
 	} else if code.Message != "" {
 		return "", errors.New(code.Message)
+	} else if code.Code == "" {
+		return "", errors.New("failed to create OAuth authorization code")
 	}
 
-	sep := "?"
-	if strings.Contains(redirectUri, "?") {
-		sep = "&"
+	return oauthSuccessRedirect(request, code.Code)
+}
+
+func oauthSuccessRedirect(request object.AuthorizationRequest, code string) (string, error) {
+	redirectUrl, err := url.Parse(request.RedirectUri)
+	if err != nil {
+		return "", err
 	}
-	res := fmt.Sprintf("%s%scode=%s&state=%s", redirectUri, sep, code.Code, state)
-	return res, nil
+	query := redirectUrl.Query()
+	query.Set("code", code)
+	query.Set("state", request.State)
+	redirectUrl.RawQuery = query.Encode()
+	return redirectUrl.String(), nil
+}
+
+func oauthErrorRedirect(request object.AuthorizationRequest, errorCode string) string {
+	redirectUrl, err := url.Parse(request.RedirectUri)
+	if err != nil {
+		return request.RedirectUri
+	}
+	query := redirectUrl.Query()
+	query.Set("error", errorCode)
+	if request.State != "" {
+		query.Set("state", request.State)
+	}
+	redirectUrl.RawQuery = query.Encode()
+	return redirectUrl.String()
 }
 
 func StaticFilter(ctx *context.Context) {

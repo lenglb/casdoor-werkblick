@@ -678,21 +678,19 @@ func GetMaskedUser(user *User, isAdminOrSelf bool, errs ...error) (*User, error)
 	if user.Password != "" {
 		user.Password = "***"
 	}
-
-	if !isAdminOrSelf {
-		if user.OriginalToken != "" {
-			user.OriginalToken = "***"
-		}
-		if user.OriginalRefreshToken != "" {
-			user.OriginalRefreshToken = "***"
-		}
-		// Mask per-provider OAuth tokens in Properties
-		if user.Properties != nil {
-			for key := range user.Properties {
-				// More specific pattern matching to avoid masking unrelated properties
-				if strings.HasPrefix(key, "oauth_") && (strings.HasSuffix(key, "_accessToken") || strings.HasSuffix(key, "_refreshToken")) {
-					user.Properties[key] = "***"
-				}
+	// OAuth and account tokens are bearer credentials, not editable profile
+	// fields. Never return them to a browser, even for self/admin responses.
+	user.AccessToken = ""
+	if user.OriginalToken != "" {
+		user.OriginalToken = "***"
+	}
+	if user.OriginalRefreshToken != "" {
+		user.OriginalRefreshToken = "***"
+	}
+	if user.Properties != nil {
+		for key := range user.Properties {
+			if strings.HasPrefix(strings.ToLower(key), "oauth_") {
+				user.Properties[key] = "***"
 			}
 		}
 	}
@@ -1451,7 +1449,14 @@ func (user *User) IsMfaEnabled() bool {
 	if user == nil {
 		return false
 	}
-	return user.PreferredMfaType != ""
+	// Preference is a UI choice, not evidence that MFA is enabled. Derive the
+	// security state from the actual enrolled factor material so clearing or
+	// corrupting PreferredMfaType cannot bypass a required challenge.
+	return user.MfaPhoneEnabled ||
+		user.MfaEmailEnabled ||
+		user.TotpSecret != "" ||
+		user.MfaRadiusEnabled ||
+		user.MfaPushEnabled
 }
 
 func (user *User) GetPreferredMfaProps(masked bool) *MfaProps {

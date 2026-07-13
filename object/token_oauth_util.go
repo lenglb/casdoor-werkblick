@@ -16,6 +16,7 @@ package object
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"net/url"
@@ -41,10 +42,11 @@ const (
 	DeviceAuthExpiresIn  = 120
 	DeviceAuthInterval   = 5
 
-	DeviceAuthStatusPending     = "pending"
-	DeviceAuthStatusApproved    = "approved"
-	DeviceAuthStatusDenied      = "denied"
-	DeviceAuthStatusTokenIssued = "token_issued"
+	DeviceAuthStatusPending      = "pending"
+	DeviceAuthStatusApproved     = "approved"
+	DeviceAuthStatusDenied       = "denied"
+	DeviceAuthStatusTokenIssuing = "token_issuing"
+	DeviceAuthStatusTokenIssued  = "token_issued"
 )
 
 // DeviceAuthMap stores the transient state of the OAuth 2.0 Device Authorization Grant (RFC 8628).
@@ -93,19 +95,22 @@ type IntrospectionResponse struct {
 }
 
 type DeviceAuthCache struct {
-	UserSignIn    bool
-	UserName      string
-	ApplicationId string
-	ClientId      string
-	Scope         string
-	RequestAt     time.Time
-	Status        string
-	CancelToken   string
-	ExpiresIn     int
+	UserSignIn            bool
+	UserName              string
+	ApplicationId         string
+	ClientId              string
+	Scope                 string
+	RequestAt             time.Time
+	Status                string
+	CancelToken           string
+	ExpiresIn             int
+	AuthenticationContext AuthenticationContext
 }
 
 func InitCleanupDeviceAuthMap() {
 	InitDeviceAuthStore()
+	InitDPoPReplayStore()
+	InitClientAssertionReplayStore()
 	util.SafeGoroutine(func() {
 		ticker := time.NewTicker(time.Minute)
 		defer ticker.Stop()
@@ -299,7 +304,16 @@ func CheckOAuthLogin(clientId string, responseType string, redirectUri string, s
 	return "", application, nil
 }
 
+// GetOAuthCode is retained for source compatibility with integrations compiled
+// against the legacy API. Provider and sign-in labels are not trusted
+// authentication evidence, so legacy issuance fails closed. Callers must move
+// to GetOAuthCodeWithAuthenticationContext.
+// Deprecated: use GetOAuthCodeWithAuthenticationContext.
 func GetOAuthCode(userId string, clientId string, provider string, signinMethod string, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, host string, lang string) (*Code, error) {
+	return nil, fmt.Errorf("legacy GetOAuthCode cannot issue tokens without trusted authentication context")
+}
+
+func GetOAuthCodeWithAuthenticationContext(userId string, clientId string, authenticationContext AuthenticationContext, responseType string, redirectUri string, scope string, state string, nonce string, challenge string, resource string, host string, lang string) (*Code, error) {
 	user, err := GetUser(userId)
 	if err != nil {
 		return nil, err
@@ -316,6 +330,14 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 			Message: "error: the user is forbidden to sign in, please contact the administrator",
 			Code:    "",
 		}, nil
+	}
+
+	authenticationContext, err = PreserveAuthenticationContext(authenticationContext)
+	if err != nil {
+		return nil, fmt.Errorf("invalid authentication context: %w", err)
+	}
+	if authenticationContext.Subject != user.GetId() {
+		return nil, fmt.Errorf("authentication context subject %q does not match user %q", authenticationContext.Subject, user.GetId())
 	}
 
 	msg, application, err := CheckOAuthLogin(clientId, responseType, redirectUri, scope, state, lang)
@@ -352,7 +374,7 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 	if err != nil {
 		return nil, err
 	}
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, user, provider, signinMethod, nonce, scope, resource, host)
+	accessToken, refreshToken, tokenName, err := generateJwtTokenWithAuthenticationContext(application, user, authenticationContext, nonce, scope, resource, host)
 	if err != nil {
 		return nil, err
 	}
@@ -373,11 +395,15 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 		RefreshToken:  refreshToken,
 		ExpiresIn:     int(application.ExpireInHours * float64(hourSeconds)),
 		Scope:         scope,
+		Nonce:         nonce,
 		TokenType:     "Bearer",
 		CodeChallenge: challenge,
 		CodeIsUsed:    false,
 		CodeExpireIn:  time.Now().Add(time.Minute * 5).Unix(),
 		Resource:      resource,
+	}
+	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
+		return nil, err
 	}
 	_, err = AddToken(token)
 	if err != nil {
@@ -390,7 +416,7 @@ func GetOAuthCode(userId string, clientId string, provider string, signinMethod 
 	}, nil
 }
 
-func RefreshToken(application *Application, grantType string, refreshToken string, scope string, clientId string, clientSecret string, host string, dpopProof string) (interface{}, error) {
+func RefreshToken(application *Application, grantType string, refreshToken string, scope string, clientId string, clientSecret string, host string, dpopProof string, dpopHtus ...string) (interface{}, error) {
 	if grantType != "refresh_token" {
 		return &TokenError{
 			Error:            UnsupportedGrantType,
@@ -413,19 +439,46 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		}
 	}
 
-	if clientSecret != "" && application.ClientSecret != clientSecret {
-		return &TokenError{
-			Error:            InvalidClient,
-			ErrorDescription: "client_secret is invalid",
-		}, nil
-	}
-
 	// check whether the refresh token is valid, and has not expired.
 	token, err := GetTokenByRefreshToken(refreshToken)
 	if err != nil || token == nil {
 		return &TokenError{
 			Error:            InvalidGrant,
 			ErrorDescription: "refresh token is invalid or revoked",
+		}, nil
+	}
+	if token.Owner != application.Owner || token.Application != application.Name {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token was not issued to this application",
+		}, nil
+	}
+	if clientId != "" && clientId != application.ClientId {
+		return &TokenError{
+			Error:            InvalidClient,
+			ErrorDescription: "client_id does not match the refresh token application",
+		}, nil
+	}
+	if application.IsPublicClient() {
+		if token.CodeChallenge == "" || clientSecret != "" {
+			return &TokenError{
+				Error:            InvalidClient,
+				ErrorDescription: "public-client refresh requires the original PKCE grant and no client secret",
+			}, nil
+		}
+	} else if subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
+		return &TokenError{
+			Error:            InvalidClient,
+			ErrorDescription: "confidential client authentication failed",
+		}, nil
+	}
+	if token.RefreshTokenConsumed {
+		if err = revokeRefreshTokenFamily(token); err != nil {
+			return nil, err
+		}
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token reuse detected; the token family has been revoked",
 		}, nil
 	}
 
@@ -448,45 +501,96 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		}, nil
 	}
 
-	var oldTokenScope string
-	if application.TokenFormat == "JWT-Standard" {
-		oldToken, err := ParseStandardJwtToken(refreshToken, cert)
-		if err != nil {
-			return &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: fmt.Sprintf("parse refresh token error: %s", err.Error()),
-			}, nil
-		}
-		oldTokenScope = oldToken.Scope
-	} else {
-		oldToken, err := ParseJwtToken(refreshToken, cert)
-		if err != nil {
-			return &TokenError{
-				Error:            InvalidGrant,
-				ErrorDescription: fmt.Sprintf("parse refresh token error: %s", err.Error()),
-			}, nil
-		}
-		oldTokenScope = oldToken.Scope
+	oldToken, err := ParseRefreshJwtToken(refreshToken, cert)
+	if err != nil {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("parse refresh token error: %s", err.Error()),
+		}, nil
+	}
+	if oldToken.Azp != application.ClientId {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token authorized party does not match client_id",
+		}, nil
+	}
+	if oldToken.ID != token.GetId() {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token identifier does not match the persisted grant",
+		}, nil
+	}
+	if oldToken.Scope != token.Scope {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token scope does not match the persisted grant",
+		}, nil
+	}
+	if oldToken.Cnf != nil && oldToken.Cnf.JKT != token.DPoPJkt {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token key binding does not match the persisted grant",
+		}, nil
+	}
+	if oldToken.Cnf == nil && token.DPoPJkt != "" {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token is missing its persisted DPoP binding",
+		}, nil
+	}
+	if oldToken.AuthTime != token.AuthTime || !slices.Equal(oldToken.AuthenticationMethods, token.AuthenticationMethods) {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token authentication evidence does not match the persisted grant",
+		}, nil
 	}
 
 	if scope == "" {
-		scope = oldTokenScope
+		scope = token.Scope
+	} else {
+		expandedScope, ok := IsScopeValidAndExpand(scope, application)
+		if !ok {
+			return &TokenError{
+				Error:            InvalidScope,
+				ErrorDescription: "the requested scope is invalid or not defined in the application",
+			}, nil
+		}
+		originalScopes := map[string]struct{}{}
+		for _, originalScope := range strings.Fields(token.Scope) {
+			originalScopes[originalScope] = struct{}{}
+		}
+		for _, requestedScope := range strings.Fields(expandedScope) {
+			if _, ok = originalScopes[requestedScope]; !ok {
+				return &TokenError{
+					Error:            InvalidScope,
+					ErrorDescription: fmt.Sprintf("requested scope %q exceeds the original grant", requestedScope),
+				}, nil
+			}
+		}
+		scope = expandedScope
 	}
 
 	// generate a new token
-	user, err := getUser(application.Organization, token.User)
+	user, err := getUser(token.Organization, token.User)
 	if err != nil {
 		return nil, err
 	}
 	if user == nil {
-		return "", fmt.Errorf("The user: %s doesn't exist", util.GetId(application.Organization, token.User))
+		return "", fmt.Errorf("The user: %s doesn't exist", util.GetId(token.Organization, token.User))
 	}
-
-	if user.IsForbidden {
+	if oldToken.Subject != user.Id {
 		return &TokenError{
 			Error:            InvalidGrant,
-			ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
+			ErrorDescription: "refresh token subject does not match the persisted user",
 		}, nil
+	}
+
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil {
+		return nil, err
+	}
+	if tokenError != nil {
+		return tokenError, nil
 	}
 
 	err = ExtendUserWithRolesAndPermissions(user)
@@ -494,53 +598,91 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 		return nil, err
 	}
 
-	newAccessToken, newRefreshToken, tokenName, err := generateJwtToken(application, user, "", "", "", scope, "", host)
+	authenticationContext, err := token.GetAuthenticationContext()
+	if err != nil {
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: fmt.Sprintf("refresh token authentication context is invalid: %s", err.Error()),
+		}, nil
+	}
+
+	newTokenType := "Bearer"
+	newDPoPJkt := ""
+	if token.DPoPJkt != "" && dpopProof == "" {
+		return &TokenError{
+			Error:            "invalid_dpop_proof",
+			ErrorDescription: "a DPoP proof is required for this refresh token",
+		}, nil
+	}
+	if dpopProof != "" {
+		dpopHtu := GetDPoPHtu(host, "/api/login/oauth/access_token")
+		if len(dpopHtus) > 0 && strings.TrimSpace(dpopHtus[0]) != "" {
+			dpopHtu = strings.TrimSpace(dpopHtus[0])
+		}
+		jkt, dpopErr := ValidateDPoPProof(dpopProof, "POST", dpopHtu, "")
+		if dpopErr != nil {
+			return &TokenError{
+				Error:            "invalid_dpop_proof",
+				ErrorDescription: dpopErr.Error(),
+			}, nil
+		}
+		if token.DPoPJkt != "" &&
+			subtle.ConstantTimeCompare([]byte(token.DPoPJkt), []byte(jkt)) != 1 {
+			return &TokenError{
+				Error:            "invalid_dpop_proof",
+				ErrorDescription: "DPoP proof key does not match the refresh token binding",
+			}, nil
+		}
+		newTokenType = "DPoP"
+		newDPoPJkt = jkt
+	}
+
+	newAccessToken, newRefreshToken, tokenName, err := generateJwtTokenWithAuthenticationContextAndDPoP(application, user, authenticationContext, newDPoPJkt, "", scope, token.Resource, host)
 	if err != nil {
 		return &TokenError{
 			Error:            EndpointError,
 			ErrorDescription: fmt.Sprintf("generate jwt token error: %s", err.Error()),
 		}, nil
 	}
+	if token.RefreshTokenFamily == "" {
+		token.RefreshTokenFamily = token.GetId()
+	}
 
 	newToken := &Token{
-		Owner:        application.Owner,
-		Name:         tokenName,
-		CreatedTime:  util.GetCurrentTime(),
-		Application:  application.Name,
-		Organization: user.Owner,
-		User:         user.Name,
-		Code:         util.GenerateClientId(),
-		AccessToken:  newAccessToken,
-		RefreshToken: newRefreshToken,
-		ExpiresIn:    int(application.ExpireInHours * float64(hourSeconds)),
-		Scope:        scope,
-		TokenType:    "Bearer",
+		Owner:              application.Owner,
+		Name:               tokenName,
+		CreatedTime:        util.GetCurrentTime(),
+		Application:        application.Name,
+		Organization:       user.Owner,
+		User:               user.Name,
+		Code:               util.GenerateClientId(),
+		AccessToken:        newAccessToken,
+		RefreshToken:       newRefreshToken,
+		ExpiresIn:          int(application.ExpireInHours * float64(hourSeconds)),
+		Scope:              scope,
+		TokenType:          newTokenType,
+		GrantType:          "refresh_token",
+		CodeChallenge:      token.CodeChallenge,
+		Resource:           token.Resource,
+		DPoPJkt:            newDPoPJkt,
+		RefreshTokenFamily: token.RefreshTokenFamily,
 	}
-	_, err = AddToken(newToken)
-	if err != nil {
+	if err = newToken.SetAuthenticationContext(authenticationContext); err != nil {
 		return nil, err
 	}
 
-	// Apply DPoP binding to the refreshed token if a DPoP proof was provided.
-	if dpopProof != "" {
-		dpopHtu := GetDPoPHtu(host, "/api/login/oauth/access_token")
-		jkt, err := ValidateDPoPProof(dpopProof, "POST", dpopHtu, "")
-		if err != nil {
-			return &TokenError{
-				Error:            "invalid_dpop_proof",
-				ErrorDescription: err.Error(),
-			}, nil
-		}
-		newToken.TokenType = "DPoP"
-		newToken.DPoPJkt = jkt
-		if err = updateTokenDPoP(newToken); err != nil {
-			return nil, err
-		}
-	}
-
-	_, err = DeleteToken(token)
+	rotated, err := rotateRefreshToken(token, newToken)
 	if err != nil {
 		return nil, err
+	}
+	if !rotated {
+		if revokeErr := revokeRefreshTokenFamily(token); revokeErr != nil {
+			return nil, revokeErr
+		}
+		return &TokenError{
+			Error:            InvalidGrant,
+			ErrorDescription: "refresh token reuse detected; the token family has been revoked",
+		}, nil
 	}
 
 	tokenWrapper := &TokenWrapper{
@@ -553,6 +695,12 @@ func RefreshToken(application *Application, grantType string, refreshToken strin
 	}
 	return tokenWrapper, nil
 }
+
+const (
+	clientAssertionMaxLifetime = 5 * time.Minute
+	clientAssertionFutureSkew  = 30 * time.Second
+	clientAssertionMaxJtiBytes = 256
+)
 
 func ValidateJwtAssertion(clientAssertion string, application *Application, host string) (bool, *Claims, error) {
 	_, originBackend := getOriginFromHost(host)
@@ -570,15 +718,71 @@ func ValidateJwtAssertion(clientAssertion string, application *Application, host
 		return false, nil, err
 	}
 
-	if !slices.Contains(application.RedirectUris, claims.Issuer) {
-		return false, nil, nil
-	}
-
-	if !slices.Contains(claims.Audience, fmt.Sprintf("%s/api/login/oauth/access_token", originBackend)) {
-		return false, nil, nil
+	if err = validateClientAssertionClaims(application, claims, originBackend, time.Now(), true); err != nil {
+		return false, claims, err
 	}
 
 	return true, claims, nil
+}
+
+func validateClientAssertionClaims(application *Application, claims *Claims, originBackend string, now time.Time, consumeReplay bool) error {
+	if application == nil || claims == nil {
+		return fmt.Errorf("client assertion claims are invalid")
+	}
+	if claims.Subject != application.ClientId || claims.Issuer != application.ClientId {
+		return fmt.Errorf("client assertion iss and sub must equal client_id")
+	}
+
+	expectedAudience := fmt.Sprintf("%s/api/login/oauth/access_token", strings.TrimRight(originBackend, "/"))
+	if len(claims.Audience) != 1 || claims.Audience[0] != expectedAudience {
+		return fmt.Errorf("client assertion aud must exactly match the token endpoint")
+	}
+	if claims.ExpiresAt == nil {
+		return fmt.Errorf("client assertion missing exp claim")
+	}
+	if claims.IssuedAt == nil {
+		return fmt.Errorf("client assertion missing iat claim")
+	}
+	if claims.ID == "" || strings.TrimSpace(claims.ID) == "" {
+		return fmt.Errorf("client assertion missing jti claim")
+	}
+	if len(claims.ID) > clientAssertionMaxJtiBytes {
+		return fmt.Errorf("client assertion jti is too long")
+	}
+
+	issuedAt := claims.IssuedAt.Time
+	expiresAt := claims.ExpiresAt.Time
+	if issuedAt.After(now.Add(clientAssertionFutureSkew)) {
+		return fmt.Errorf("client assertion iat is too far in the future")
+	}
+	if issuedAt.Before(now.Add(-clientAssertionMaxLifetime)) {
+		return fmt.Errorf("client assertion iat is outside the acceptable time window")
+	}
+	if !expiresAt.After(now) {
+		return fmt.Errorf("client assertion has expired")
+	}
+	if !expiresAt.After(issuedAt) || expiresAt.Sub(issuedAt) > clientAssertionMaxLifetime {
+		return fmt.Errorf("client assertion lifetime must be at most %s", clientAssertionMaxLifetime)
+	}
+
+	if consumeReplay {
+		replayKeyInput := strings.Join([]string{application.ClientId, claims.ID}, "\x00")
+		replayKeyHash := sha256.Sum256([]byte(replayKeyInput))
+		replayKey := base64.RawURLEncoding.EncodeToString(replayKeyHash[:])
+		if err := useClientAssertionOnce(replayKey, expiresAt.Sub(now)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func ValidateClientAssertionForApplication(clientAssertion string, application *Application, host string) (bool, error) {
+	if application == nil || application.GetTokenEndpointAuthMethod() != ClientAuthMethodPrivateKeyJwt {
+		return false, nil
+	}
+	ok, _, err := ValidateJwtAssertion(clientAssertion, application, host)
+	return ok, err
 }
 
 func ValidateClientAssertion(clientAssertion string, host string) (bool, *Application, error) {
@@ -599,8 +803,11 @@ func ValidateClientAssertion(clientAssertion string, host string) (bool, *Applic
 	if application == nil {
 		return false, nil, fmt.Errorf("application not found for client: [%s]", clientId)
 	}
+	if application.GetTokenEndpointAuthMethod() != ClientAuthMethodPrivateKeyJwt {
+		return false, application, nil
+	}
 
-	ok, _, err := ValidateJwtAssertion(clientAssertion, application, host)
+	ok, err := ValidateClientAssertionForApplication(clientAssertion, application, host)
 	if err != nil {
 		return false, application, err
 	}
@@ -614,6 +821,10 @@ func ValidateClientAssertion(clientAssertion string, host string) (bool, *Applic
 // mintImplicitToken mints a token for an already-authenticated user.
 // Callers must verify user identity before calling this function.
 func mintImplicitToken(application *Application, username string, scope string, nonce string, host string) (*Token, *TokenError, error) {
+	return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
+}
+
+func mintImplicitTokenWithAuthenticationContext(application *Application, username string, scope string, nonce string, host string, authenticationContext *AuthenticationContext) (*Token, *TokenError, error) {
 	expandedScope, ok := IsScopeValidAndExpand(scope, application)
 	if !ok {
 		return nil, &TokenError{
@@ -633,87 +844,116 @@ func mintImplicitToken(application *Application, username string, scope string, 
 			ErrorDescription: "the user does not exist",
 		}, nil
 	}
-	if user.IsForbidden {
-		return nil, &TokenError{
-			Error:            InvalidGrant,
-			ErrorDescription: "the user is forbidden to sign in, please contact the administrator",
-		}, nil
+
+	user, tokenError, err := revalidateUserTokenAccess(application, user)
+	if err != nil || tokenError != nil {
+		return nil, tokenError, err
 	}
 
-	token, err := GetTokenByUser(application, user, scope, nonce, host)
+	if authenticationContext == nil {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "trusted authentication context is required"}, nil
+	}
+	token, err := GetTokenByUserWithAuthenticationContext(application, user, scope, nonce, host, *authenticationContext)
 	if err != nil {
 		return nil, nil, err
 	}
 	return token, nil, nil
 }
 
-// parseAndValidateSubjectToken validates a subject_token for RFC 8693 token exchange.
-// It uses the ISSUING application's certificate (not the requesting client's) and
-// enforces audience binding to prevent cross-client token reuse.
-func parseAndValidateSubjectToken(subjectToken string, requestingClientId string) (owner, name, scope string, tokenErr *TokenError, err error) {
-	unverifiedToken, err := ParseJwtTokenWithoutValidation(subjectToken)
+type validatedSubjectToken struct {
+	Owner                 string
+	Name                  string
+	Subject               string
+	Scope                 string
+	AuthenticationContext AuthenticationContext
+	DPoPJkt               string
+}
+
+// parseAndValidateSubjectToken validates a subject_token for RFC 8693 token
+// exchange. The persisted access-token record is the revocation and token-type
+// boundary; unverified JWT claims are never used to select an application.
+func parseAndValidateSubjectToken(subjectToken string, requestingClientId string, proofJkt string) (*validatedSubjectToken, *TokenError, error) {
+	record, err := GetTokenByAccessToken(subjectToken)
 	if err != nil {
-		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
+		return nil, nil, err
+	}
+	if record == nil || record.ExpiresIn <= 0 || !record.CodeIsUsed {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token is not an active access token"}, nil
 	}
 
-	unverifiedClaims, ok := unverifiedToken.Claims.(*Claims)
-	if !ok || unverifiedClaims.Azp == "" {
-		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token is missing the azp claim"}, nil
-	}
-
-	issuingApp, err := GetApplicationByClientId(unverifiedClaims.Azp)
+	issuingApp, err := GetApplication(util.GetId(record.Owner, record.Application))
 	if err != nil {
-		return "", "", "", nil, err
+		return nil, nil, err
 	}
 	if issuingApp == nil {
-		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token issuing application not found: %s", unverifiedClaims.Azp)}, nil
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token issuing application does not exist"}, nil
 	}
-
 	cert, err := getCertByApplication(issuingApp)
 	if err != nil {
-		return "", "", "", nil, err
+		return nil, nil, err
 	}
 	if cert == nil {
-		return "", "", "", &TokenError{Error: EndpointError, ErrorDescription: fmt.Sprintf("cert for issuing application %s cannot be found", unverifiedClaims.Azp)}, nil
+		return nil, &TokenError{Error: EndpointError, ErrorDescription: "subject_token issuing certificate does not exist"}, nil
 	}
 
+	var tokenType, azp, signedScope, subject string
+	var audience []string
+	var confirmation *DPoPConfirmation
 	if issuingApp.TokenFormat == "JWT-Standard" {
-		standardClaims, err := ParseStandardJwtToken(subjectToken, cert)
-		if err != nil {
-			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
+		claims, parseErr := ParseStandardJwtToken(subjectToken, cert)
+		if parseErr != nil {
+			return nil, &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", parseErr.Error())}, nil
 		}
-		return standardClaims.Owner, standardClaims.Name, standardClaims.Scope, nil, nil
+		tokenType, azp, signedScope, subject = claims.TokenType, claims.Azp, claims.Scope, claims.Subject
+		audience, confirmation = claims.Audience, claims.Cnf
+	} else {
+		claims, parseErr := ParseJwtToken(subjectToken, cert)
+		if parseErr != nil {
+			return nil, &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", parseErr.Error())}, nil
+		}
+		tokenType, azp, signedScope, subject = claims.TokenType, claims.Azp, claims.Scope, claims.Subject
+		audience, confirmation = claims.Audience, claims.Cnf
 	}
 
-	claims, err := ParseJwtToken(subjectToken, cert)
+	if tokenType != "access-token" {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token is not an access token"}, nil
+	}
+	if azp != issuingApp.ClientId || signedScope != record.Scope {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token claims do not match the persisted grant"}, nil
+	}
+	if !DPoPConfirmationMatches(confirmation, record.DPoPJkt) {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: "subject_token key binding does not match the persisted grant"}, nil
+	}
+	if issuingApp.ClientId != requestingClientId && !slices.Contains(audience, requestingClientId) {
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token audience does not include the requesting client %q", requestingClientId)}, nil
+	}
+	if record.DPoPJkt != "" {
+		if proofJkt == "" || subtle.ConstantTimeCompare([]byte(record.DPoPJkt), []byte(proofJkt)) != 1 {
+			return nil, &TokenError{Error: "invalid_dpop_proof", ErrorDescription: "proof key does not match the DPoP-bound subject_token"}, nil
+		}
+	}
+
+	authenticationContext, err := record.GetAuthenticationContext()
 	if err != nil {
-		return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("invalid subject_token: %s", err.Error())}, nil
+		return nil, &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token authentication context is invalid: %s", err.Error())}, nil
 	}
-
-	// Audience binding: requesting client must be the issuer itself or appear in token's aud.
-	// Prevents an attacker from exchanging App A's token to obtain an App B token (RFC 8693 §2.1).
-	if issuingApp.ClientId != requestingClientId {
-		audienceMatched := false
-		for _, aud := range claims.Audience {
-			if aud == requestingClientId {
-				audienceMatched = true
-				break
-			}
-		}
-		if !audienceMatched {
-			return "", "", "", &TokenError{Error: InvalidGrant, ErrorDescription: fmt.Sprintf("subject_token audience does not include the requesting client '%s'", requestingClientId)}, nil
-		}
-	}
-
-	return claims.Owner, claims.Name, claims.Scope, nil, nil
+	return &validatedSubjectToken{
+		Owner:                 record.Organization,
+		Name:                  record.User,
+		Subject:               subject,
+		Scope:                 record.Scope,
+		AuthenticationContext: authenticationContext,
+		DPoPJkt:               record.DPoPJkt,
+	}, nil, nil
 }
 
 // createGuestUserToken creates a new guest user and returns a token for them.
-func createGuestUserToken(application *Application, clientSecret string, verifier string) (*Token, *TokenError, error) {
-	if clientSecret != "" && application.ClientSecret != clientSecret {
+func createGuestUserToken(application *Application, clientSecret string, verifier string, hosts ...string) (*Token, *TokenError, error) {
+	if clientSecret == "" ||
+		subtle.ConstantTimeCompare([]byte(application.ClientSecret), []byte(clientSecret)) != 1 {
 		return nil, &TokenError{
 			Error:            InvalidClient,
-			ErrorDescription: "client_secret is invalid",
+			ErrorDescription: "guest-user authorization requires a valid client_secret",
 		}, nil
 	}
 
@@ -792,7 +1032,19 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		}, nil
 	}
 
-	accessToken, refreshToken, tokenName, err := generateJwtToken(application, guestUser, "", "", "", "", "", "")
+	authenticationContext, err := PreserveAuthenticationContext(AuthenticationContext{
+		Subject:  guestUser.GetId(),
+		AuthTime: time.Now().Unix(),
+		Amr:      []string{"guest"},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	host := ""
+	if len(hosts) > 0 {
+		host = hosts[0]
+	}
+	accessToken, refreshToken, tokenName, err := generateJwtTokenWithAuthenticationContext(application, guestUser, authenticationContext, "", "", "", host)
 	if err != nil {
 		return nil, &TokenError{
 			Error:            EndpointError,
@@ -816,6 +1068,9 @@ func createGuestUserToken(application *Application, clientSecret string, verifie
 		CodeChallenge: "",
 		CodeIsUsed:    true,
 		CodeExpireIn:  0,
+	}
+	if err = token.SetAuthenticationContext(authenticationContext); err != nil {
+		return nil, nil, err
 	}
 
 	_, err = AddToken(token)

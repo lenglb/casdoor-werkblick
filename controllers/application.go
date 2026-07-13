@@ -114,7 +114,12 @@ func (c *ApiController) GetApplication() {
 	clientIp := util.GetClientIpFromRequest(c.Ctx.Request)
 	object.CheckEntryIp(clientIp, nil, application, nil, c.GetAcceptLanguage())
 
-	c.ResponseOk(object.GetMaskedApplication(application, userId))
+	application = object.GetMaskedApplication(application, userId)
+	if err = c.attachProviderStates(application); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	c.ResponseOk(application)
 }
 
 // GetUserApplication
@@ -148,7 +153,12 @@ func (c *ApiController) GetUserApplication() {
 		return
 	}
 
-	c.ResponseOk(object.GetMaskedApplication(application, userId))
+	application = object.GetMaskedApplication(application, userId)
+	if err = c.attachProviderStates(application); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	c.ResponseOk(application)
 }
 
 // GetOrganizationApplications

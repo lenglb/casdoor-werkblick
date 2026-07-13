@@ -15,48 +15,13 @@
 import React from "react";
 import {Link} from "react-router-dom";
 import {Button, Table} from "antd";
-import moment from "moment";
 import * as Setting from "./Setting";
-import * as Conf from "./Conf";
 import * as TokenBackend from "./backend/TokenBackend";
 import i18next from "i18next";
 import BaseListPage from "./BaseListPage";
 import PopconfirmModal from "./common/modal/PopconfirmModal";
 
 class TokenListPage extends BaseListPage {
-  newToken() {
-    const randomName = Setting.getRandomName();
-    const organizationName = Setting.getRequestOrganization(this.props.account);
-    return {
-      owner: "admin", // this.props.account.tokenname,
-      name: `token_${randomName}`,
-      createdTime: moment().format(),
-      application: Conf.DefaultApplication,
-      organization: organizationName,
-      user: "admin",
-      accessToken: "",
-      expiresIn: 7200,
-      scope: "read",
-      tokenType: "Bearer",
-    };
-  }
-
-  addToken() {
-    const newToken = this.newToken();
-    TokenBackend.addToken(newToken)
-      .then((res) => {
-        if (res.status === "ok") {
-          this.props.history.push({pathname: `/tokens/${newToken.name}`, mode: "add"});
-          Setting.showMessage("success", i18next.t("general:Successfully added"));
-        } else {
-          Setting.showMessage("error", `${i18next.t("general:Failed to add")}: ${res.msg}`);
-        }
-      })
-      .catch(error => {
-        Setting.showMessage("error", `${i18next.t("general:Failed to connect to server")}: ${error}`);
-      });
-  }
-
   deleteToken(i) {
     TokenBackend.deleteToken(this.state.data[i])
       .then((res) => {
@@ -151,29 +116,6 @@ class TokenListPage extends BaseListPage {
         },
       },
       {
-        title: i18next.t("token:Authorization code"),
-        dataIndex: "code",
-        key: "code",
-        width: "180px",
-        sorter: true,
-        ...this.getColumnSearchProps("code"),
-        render: (text, record, index) => {
-          return Setting.getClickable(text);
-        },
-      },
-      {
-        title: i18next.t("token:Access token"),
-        dataIndex: "accessToken",
-        key: "accessToken",
-        width: "220px",
-        sorter: true,
-        ellipsis: true,
-        ...this.getColumnSearchProps("accessToken"),
-        render: (text, record, index) => {
-          return Setting.getClickable(text);
-        },
-      },
-      {
         title: i18next.t("token:Expires in"),
         dataIndex: "expiresIn",
         key: "expiresIn",
@@ -230,7 +172,7 @@ class TokenListPage extends BaseListPage {
           title={() => (
             <div>
               {i18next.t("general:Tokens")}&nbsp;&nbsp;&nbsp;&nbsp;
-              <Button type="primary" size="small" onClick={this.addToken.bind(this)}>{i18next.t("general:Add")}</Button>
+              <span data-testid="token-credential-notice" style={{color: "#8c8c8c"}}>{i18next.t("token:Credentials are never displayed; use OAuth grants to issue tokens.")}</span>
             </div>
           )}
           loading={this.getTableLoading()}

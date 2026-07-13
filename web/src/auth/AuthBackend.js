@@ -51,18 +51,56 @@ export function casLoginParamsToQuery(casParams) {
   return `?type=${casParams?.type}&id=${casParams?.id}&redirectUri=${casParams?.service}`;
 }
 
-export function oAuthParamsToQuery(oAuthParams) {
-  // login
-  if (oAuthParams === null || oAuthParams === undefined) {
+export function oAuthParamsToSearchParams(oAuthParams, overrides = {}) {
+  const values = {...(oAuthParams || {}), ...overrides};
+  const params = new URLSearchParams();
+  const mappings = [
+    ["clientId", values.clientId],
+    ["responseType", values.responseType],
+    ["redirectUri", values.redirectUri],
+    ["type", values.type],
+    ["scope", values.scope],
+    ["state", values.state],
+    ["nonce", values.nonce],
+    ["code_challenge_method", values.challengeMethod],
+    ["code_challenge", values.codeChallenge],
+    ["resource", values.resource],
+    ["response_mode", values.responseMode],
+    ["prompt", values.prompt],
+    ["maxAge", values.maxAge],
+  ];
+
+  mappings.forEach(([name, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(name, String(value));
+    }
+  });
+
+  return params;
+}
+
+// WebAuthn is a two-request authentication ceremony. Build its OAuth query
+// once so begin and finish cannot drift on nonce, state, PKCE, scope, prompt,
+// max_age, resource, client, or redirect URI.
+export function getWebAuthnSigninSearchParams(oAuthParams, responseType) {
+  const normalizedResponseType = responseType || "login";
+  if (normalizedResponseType === "code") {
+    return oAuthParamsToSearchParams(oAuthParams, {
+      responseType: normalizedResponseType,
+      type: normalizedResponseType,
+    });
+  }
+
+  return new URLSearchParams({responseType: normalizedResponseType});
+}
+
+export function oAuthParamsToQuery(oAuthParams, overrides = {}) {
+  if ((oAuthParams === null || oAuthParams === undefined) && Object.keys(overrides).length === 0) {
     return "";
   }
 
-  const resourceQuery = oAuthParams.resource
-    ? `&resource=${encodeURIComponent(oAuthParams.resource)}`
-    : "";
-
-  // code
-  return `?clientId=${oAuthParams.clientId}&responseType=${oAuthParams.responseType}&redirectUri=${encodeURIComponent(oAuthParams.redirectUri)}&type=${oAuthParams.type}&scope=${oAuthParams.scope}&state=${oAuthParams.state}&nonce=${oAuthParams.nonce}&code_challenge_method=${oAuthParams.challengeMethod}&code_challenge=${oAuthParams.codeChallenge}${resourceQuery}`;
+  const query = oAuthParamsToSearchParams(oAuthParams, overrides).toString();
+  return query === "" ? "" : `?${query}`;
 }
 
 export function getApplicationLogin(params) {

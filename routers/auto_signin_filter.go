@@ -15,8 +15,10 @@
 package routers
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/beego/beego/v2/server/web/context"
@@ -72,19 +74,24 @@ func AutoSigninFilter(ctx *context.Context) {
 
 		// Validate DPoP proof for DPoP-bound tokens (RFC 9449).
 		if token.TokenType == "DPoP" {
+			authorizationParts := strings.SplitN(ctx.Request.Header.Get("Authorization"), " ", 2)
+			if len(authorizationParts) != 2 || authorizationParts[0] != "DPoP" || authorizationParts[1] != accessToken {
+				responseDPoPUnauthorized(ctx, "invalid_token", "DPoP-bound access tokens require the DPoP authorization scheme")
+				return
+			}
 			dpopProof := ctx.Request.Header.Get("DPoP")
 			if dpopProof == "" {
-				responseError(ctx, "DPoP proof header required for DPoP-bound access token")
+				responseDPoPUnauthorized(ctx, "invalid_dpop_proof", "DPoP proof header is required")
 				return
 			}
-			htu := object.GetDPoPHtu(ctx.Request.Host, ctx.Request.URL.Path)
+			htu := object.GetDPoPHtu(ctx.Request.Host, ctx.Request.URL.EscapedPath())
 			jkt, dpopErr := object.ValidateDPoPProof(dpopProof, ctx.Request.Method, htu, accessToken)
 			if dpopErr != nil {
-				responseError(ctx, fmt.Sprintf("DPoP proof validation failed: %s", dpopErr.Error()))
+				responseDPoPUnauthorized(ctx, "invalid_dpop_proof", "DPoP proof validation failed")
 				return
 			}
-			if jkt != token.DPoPJkt {
-				responseError(ctx, "DPoP proof key binding mismatch")
+			if subtle.ConstantTimeCompare([]byte(jkt), []byte(token.DPoPJkt)) != 1 {
+				responseDPoPUnauthorized(ctx, "invalid_token", "DPoP proof key binding mismatch")
 				return
 			}
 		}
@@ -105,8 +112,13 @@ func AutoSigninFilter(ctx *context.Context) {
 		} else {
 			userId = util.GetId(token.Organization, token.User)
 		}
-		setSessionUser(ctx, userId)
-		setSessionOidc(ctx, token.Scope, application.ClientId)
+		// Bearer/DPoP authentication is request-scoped. Promoting it into the
+		// browser session would turn a proof-bound API token into a reusable
+		// cookie session that no longer requires the DPoP proof.
+		ctx.Input.SetData("tokenAuthenticatedUserId", userId)
+		ctx.Input.SetData("tokenAuthenticatedScope", token.Scope)
+		ctx.Input.SetData("tokenAuthenticatedAud", application.ClientId)
+		ctx.Input.SetData("tokenAuthenticatedAccessToken", accessToken)
 		return
 	}
 
@@ -150,4 +162,10 @@ func AutoSigninFilter(ctx *context.Context) {
 
 		setSessionUser(ctx, userId)
 	}
+}
+
+func responseDPoPUnauthorized(ctx *context.Context, errorCode string, description string) {
+	ctx.Output.Header("WWW-Authenticate", fmt.Sprintf(`DPoP error=%q, error_description=%q`, errorCode, description))
+	ctx.Output.SetStatus(http.StatusUnauthorized)
+	responseError(ctx, description)
 }

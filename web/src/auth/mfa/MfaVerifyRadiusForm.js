@@ -1,9 +1,9 @@
-import {Button, Checkbox, Form, Input} from "antd";
+import {Button, Form, Input} from "antd";
 import i18next from "i18next";
 import React from "react";
 import {mfaAuth} from "./MfaVerifyForm";
 
-export const MfaVerifyRadiusForm = ({mfaProps, application, onFinish, method, user}) => {
+export const MfaVerifyRadiusForm = ({mfaProps, onFinish, method}) => {
   const [form] = Form.useForm();
   return (
     <Form
@@ -12,7 +12,6 @@ export const MfaVerifyRadiusForm = ({mfaProps, application, onFinish, method, us
       onFinish={onFinish}
       initialValues={{
         countryCode: mfaProps.countryCode,
-        enableMfaRemember: false,
       }}
     >
       {
@@ -36,14 +35,6 @@ export const MfaVerifyRadiusForm = ({mfaProps, application, onFinish, method, us
           style={{width: "100%", marginTop: 12}}
           placeholder={i18next.t("general:Password")}
         />
-      </Form.Item>
-      <Form.Item
-        name="enableMfaRemember"
-        valuePropName="checked"
-      >
-        <Checkbox>
-          {i18next.t("mfa:Remember this account for {hour} hours").replace("{hour}", mfaProps?.mfaRememberInHours)}
-        </Checkbox>
       </Form.Item>
       <Form.Item>
         <Button
