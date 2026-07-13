@@ -28,6 +28,13 @@ const selector = {
   password: "#normal_login_password",
   loginButton: ".ant-btn",
 };
+function getAdminPassword() {
+  const password = Cypress.env("adminPassword");
+  if (typeof password !== "string" || password.length < 32) {
+    throw new Error("CYPRESS_adminPassword must contain the isolated E2E credential");
+  }
+  return password;
+}
 Cypress.Commands.add('login', ()=>{
   cy.visit("http://localhost:7001", {
     onBeforeLoad(win) {
@@ -36,7 +43,7 @@ Cypress.Commands.add('login', ()=>{
     },
   });
   cy.get(selector.username).type("admin");
-  cy.get(selector.password).type("123");
+  cy.get(selector.password).type(getAdminPassword(), {log: false});
   cy.get(selector.loginButton).click();
   cy.url().should("eq", "http://localhost:7001/");
 })

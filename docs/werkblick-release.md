@@ -170,6 +170,13 @@ cleanup or sync jobs, site monitoring, webhook delivery, or any listener.
 Schema-only and bootstrap-data-only are mutually exclusive. Setting both exact
 values to `true` fails before any initialization or database access.
 
+Normal first start creates only a random, forbidden built-in administrator;
+production activation therefore requires the validated bootstrap-data path.
+The upstream Cypress workflow does not weaken that runtime default: a
+build-tagged test-only helper seeds its isolated database with a masked,
+per-run random credential before the server starts. That helper is absent from
+ordinary test builds and every production binary.
+
 ## Verification and rollback
 
 Verify the exact digest before promotion:

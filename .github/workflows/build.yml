@@ -109,6 +109,20 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: ./go.mod
+      - name: Generate isolated Cypress administrator credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          password="E2E-$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
+          {
+            printf 'WERKBLICK_E2E_ADMIN_PASSWORD=%s\n' "$password"
+            printf 'CYPRESS_adminPassword=%s\n' "$password"
+          } >> "$GITHUB_ENV"
+      - name: Seed isolated Cypress administrator
+        env:
+          WERKBLICK_E2E_SEED_SCOPE: github-actions-cypress
+        run: go test -tags werkblick_e2e_seed ./object -run '^TestSeedWerkblickE2EAdmin$' -count=1
       - name: start backend
         run: nohup go run ./main.go > /tmp/backend.log 2>&1 &
         working-directory: ./
