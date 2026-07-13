@@ -36,6 +36,7 @@ var StateMap map[string]AccessStateContent
 var stateMapMutex sync.Mutex
 
 const StateExpiredTime = time.Second * 120
+const MaxPendingAccessStates = 4096
 
 var listenAndServeRadius = func(server *radius.PacketServer) error {
 	return server.ListenAndServe()
@@ -45,6 +46,20 @@ type AccessStateContent struct {
 	ExpiredAt time.Time
 	Owner     string
 	User      string
+}
+
+type accessRequestDependencies struct {
+	checkUserPassword func(organization string, username string, password string, lang string) (*object.User, error)
+	getUser           func(id string) (*object.User, error)
+	now               func() time.Time
+}
+
+var defaultAccessRequestDependencies = accessRequestDependencies{
+	checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+		return object.CheckUserPassword(organization, username, password, lang)
+	},
+	getUser: object.GetUser,
+	now:     time.Now,
 }
 
 func StartRadiusServer() {
@@ -90,6 +105,9 @@ func issueAccessState(owner string, user string, now time.Time) (string, error) 
 			delete(StateMap, candidate)
 		}
 	}
+	if len(StateMap) >= MaxPendingAccessStates {
+		return "", fmt.Errorf("too many pending RADIUS MFA challenges")
+	}
 	StateMap[state] = AccessStateContent{
 		ExpiredAt: now.Add(StateExpiredTime),
 		Owner:     owner,
@@ -126,6 +144,10 @@ func handlerRadius(w radius.ResponseWriter, r *radius.Request) {
 }
 
 func handleAccessRequest(w radius.ResponseWriter, r *radius.Request) {
+	handleAccessRequestWithDependencies(w, r, defaultAccessRequestDependencies)
+}
+
+func handleAccessRequestWithDependencies(w radius.ResponseWriter, r *radius.Request, dependencies accessRequestDependencies) {
 	username := rfc2865.UserName_GetString(r.Packet)
 	password := rfc2865.UserPassword_GetString(r.Packet)
 	organization := rfc2865.Class_GetString(r.Packet)
@@ -143,13 +165,13 @@ func handleAccessRequest(w radius.ResponseWriter, r *radius.Request) {
 	var err error
 
 	if state == "" {
-		user, err = object.CheckUserPassword(organization, username, password, "en")
+		user, err = dependencies.checkUserPassword(organization, username, password, "en")
 	} else {
-		if !consumeAccessState(state, organization, username, time.Now()) {
+		if !consumeAccessState(state, organization, username, dependencies.now()) {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
-		user, err = object.GetUser(fmt.Sprintf("%s/%s", organization, username))
+		user, err = dependencies.getUser(fmt.Sprintf("%s/%s", organization, username))
 	}
 
 	if err != nil || user == nil {
@@ -157,12 +179,12 @@ func handleAccessRequest(w radius.ResponseWriter, r *radius.Request) {
 		return
 	}
 	if state != "" {
-		if !user.IsMfaEnabled() {
+		if user.IsDeleted || user.IsForbidden || !user.IsMfaEnabled() {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
 		mfaProp := user.GetMfaProps(object.TotpType, false)
-		if mfaProp == nil {
+		if mfaProp == nil || !mfaProp.Enabled || mfaProp.Secret == "" {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
@@ -177,31 +199,32 @@ func handleAccessRequest(w radius.ResponseWriter, r *radius.Request) {
 
 	if user.IsMfaEnabled() {
 		mfaProp := user.GetMfaProps(object.TotpType, false)
-		if mfaProp == nil {
+		if mfaProp == nil || !mfaProp.Enabled || mfaProp.Secret == "" {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
 
-		responseState, stateErr := issueAccessState(organization, username, time.Now())
+		responseState, stateErr := issueAccessState(organization, username, dependencies.now())
 		if stateErr != nil {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
 
-		err = rfc2865.State_Set(r.Packet, []byte(responseState))
+		challenge := r.Response(radius.CodeAccessChallenge)
+		err = rfc2865.State_Set(challenge, []byte(responseState))
 		if err != nil {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
 
-		err = rfc2865.ReplyMessage_Set(r.Packet, []byte("please enter OTP"))
+		err = rfc2865.ReplyMessage_Set(challenge, []byte("please enter OTP"))
 		if err != nil {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
 
-		r.Packet.Code = radius.CodeAccessChallenge
-		w.Write(r.Packet)
+		w.Write(challenge)
+		return
 	}
 
 	w.Write(r.Response(radius.CodeAccessAccept))

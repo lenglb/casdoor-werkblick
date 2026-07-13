@@ -15,13 +15,45 @@
 package radius
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/casdoor/casdoor/object"
 	radiuslib "layeh.com/radius"
+	"layeh.com/radius/rfc2865"
 )
+
+type recordingRadiusResponseWriter struct {
+	packets []*radiuslib.Packet
+}
+
+func (writer *recordingRadiusResponseWriter) Write(packet *radiuslib.Packet) error {
+	writer.packets = append(writer.packets, packet)
+	return nil
+}
+
+func newRadiusAccessRequest(t *testing.T, organization string, username string, password string, state string) *radiuslib.Request {
+	t.Helper()
+	packet := radiuslib.New(radiuslib.CodeAccessRequest, []byte("unit-test-radius-secret"))
+	if err := rfc2865.Class_SetString(packet, organization); err != nil {
+		t.Fatal(err)
+	}
+	if err := rfc2865.UserName_SetString(packet, username); err != nil {
+		t.Fatal(err)
+	}
+	if err := rfc2865.UserPassword_SetString(packet, password); err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		if err := rfc2865.State_SetString(packet, state); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return &radiuslib.Request{Packet: packet}
+}
 
 func TestDisabledRadiusPortNeverStartsListener(t *testing.T) {
 	original := listenAndServeRadius
@@ -179,5 +211,134 @@ func TestExpiredAccessStateIsRejectedAndConsumed(t *testing.T) {
 	}
 	if consumeAccessState(state, "org-a", "alice", now) {
 		t.Fatal("expired state survived its first presentation")
+	}
+}
+
+func TestPendingAccessStateStoreIsBoundedAndFailsClosed(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	stateMapMutex.Lock()
+	StateMap = make(map[string]AccessStateContent, MaxPendingAccessStates)
+	for index := 0; index < MaxPendingAccessStates; index++ {
+		StateMap[fmt.Sprintf("state-%d", index)] = AccessStateContent{
+			ExpiredAt: now.Add(StateExpiredTime),
+			Owner:     "org-a",
+			User:      "alice",
+		}
+	}
+	stateMapMutex.Unlock()
+
+	if state, err := issueAccessState("org-a", "alice", now); err == nil || state != "" {
+		t.Fatalf("full RADIUS state store issued challenge (%q, %v)", state, err)
+	}
+}
+
+func TestMfaPasswordStepWritesExactlyOneChallengeAndNeverAccepts(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	user := &object.User{Owner: "org-a", Name: "alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
+	dependencies := accessRequestDependencies{
+		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+			if organization != user.Owner || username != user.Name || password != "correct-password" || lang != "en" {
+				return nil, fmt.Errorf("unexpected password check")
+			}
+			return user, nil
+		},
+		getUser: func(id string) (*object.User, error) {
+			return nil, fmt.Errorf("unexpected second-step user lookup for %s", id)
+		},
+		now: func() time.Time { return now },
+	}
+
+	writer := &recordingRadiusResponseWriter{}
+	handleAccessRequestWithDependencies(
+		writer,
+		newRadiusAccessRequest(t, user.Owner, user.Name, "correct-password", ""),
+		dependencies,
+	)
+
+	if len(writer.packets) != 1 {
+		t.Fatalf("RADIUS password step wrote %d packets, want exactly one", len(writer.packets))
+	}
+	if writer.packets[0].Code != radiuslib.CodeAccessChallenge {
+		t.Fatalf("RADIUS password step response = %v, want Access-Challenge", writer.packets[0].Code)
+	}
+	if state := rfc2865.State_GetString(writer.packets[0]); state == "" {
+		t.Fatal("RADIUS Access-Challenge omitted the one-time MFA state")
+	}
+	if reflectedPassword := rfc2865.UserPassword_Get(writer.packets[0]); len(reflectedPassword) != 0 {
+		t.Fatal("RADIUS Access-Challenge reflected the request's password attribute")
+	}
+}
+
+func TestMfaOtpFailureWritesExactlyOneRejectAndNeverAccepts(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	user := &object.User{Owner: "org-a", Name: "alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
+	state, err := issueAccessState(user.Owner, user.Name, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := accessRequestDependencies{
+		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+			return nil, fmt.Errorf("password verification must not run during the OTP step")
+		},
+		getUser: func(id string) (*object.User, error) {
+			if id != user.GetId() {
+				return nil, fmt.Errorf("unexpected user id %q", id)
+			}
+			return user, nil
+		},
+		now: func() time.Time { return now },
+	}
+
+	writer := &recordingRadiusResponseWriter{}
+	handleAccessRequestWithDependencies(
+		writer,
+		newRadiusAccessRequest(t, user.Owner, user.Name, "not-a-six-digit-code", state),
+		dependencies,
+	)
+
+	if len(writer.packets) != 1 {
+		t.Fatalf("RADIUS OTP failure wrote %d packets, want exactly one", len(writer.packets))
+	}
+	if writer.packets[0].Code != radiuslib.CodeAccessReject {
+		t.Fatalf("RADIUS OTP failure response = %v, want Access-Reject", writer.packets[0].Code)
+	}
+	if consumeAccessState(state, user.Owner, user.Name, now) {
+		t.Fatal("failed RADIUS OTP left its one-time state replayable")
+	}
+}
+
+func TestMfaOtpStepRevalidatesDisabledUserBeforeVerification(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	user := &object.User{
+		Owner:       "org-a",
+		Name:        "alice",
+		TotpSecret:  "JBSWY3DPEHPK3PXP",
+		IsForbidden: true,
+	}
+	state, err := issueAccessState(user.Owner, user.Name, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := accessRequestDependencies{
+		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+			return nil, fmt.Errorf("password verification must not run during the OTP step")
+		},
+		getUser: func(id string) (*object.User, error) { return user, nil },
+		now:     func() time.Time { return now },
+	}
+
+	writer := &recordingRadiusResponseWriter{}
+	handleAccessRequestWithDependencies(
+		writer,
+		newRadiusAccessRequest(t, user.Owner, user.Name, "000000", state),
+		dependencies,
+	)
+
+	if len(writer.packets) != 1 || writer.packets[0].Code != radiuslib.CodeAccessReject {
+		t.Fatalf("disabled RADIUS user responses = %#v, want one Access-Reject", writer.packets)
 	}
 }
