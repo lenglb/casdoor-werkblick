@@ -701,6 +701,31 @@ func linkUserByProvider(user *object.User, provider *object.Provider, providerId
 	return object.LinkUserAccount(user, provider.Type, providerId)
 }
 
+func resolvePasswordSigninMethod(application *object.Application, signinMethod string) (isSigninViaLdap bool, isPasswordWithLdapEnabled bool, err error) {
+	if application == nil {
+		return false, false, fmt.Errorf("application is missing")
+	}
+
+	switch signinMethod {
+	case "Password":
+		if !application.IsPasswordEnabled() {
+			return false, false, fmt.Errorf("the login method: login with password is not enabled for the application")
+		}
+		return false, application.IsPasswordWithLdapEnabled(), nil
+	case "LDAP":
+		if !application.IsLdapEnabled() {
+			return false, false, fmt.Errorf("the login method: login with LDAP is not enabled for the application")
+		}
+		return true, false, nil
+	default:
+		// A non-empty password is a credential, not a method selector. Requiring
+		// the exact configured method prevents empty/unknown values (notably from
+		// machine-to-machine clients) from falling through to local password
+		// verification.
+		return false, false, fmt.Errorf("the login method is invalid for password authentication")
+	}
+}
+
 // Login ...
 // @Title Login
 // @Tag Login API
@@ -879,12 +904,9 @@ func (c *ApiController) Login() {
 				c.ResponseError(fmt.Sprintf(c.T("auth:The application: %s does not exist"), authForm.Application))
 				return
 			}
-			if authForm.SigninMethod == "Password" && !application.IsPasswordEnabled() {
-				c.ResponseError(c.T("auth:The login method: login with password is not enabled for the application"))
-				return
-			}
-			if authForm.SigninMethod == "LDAP" && !application.IsLdapEnabled() {
-				c.ResponseError(c.T("auth:The login method: login with LDAP is not enabled for the application"))
+			isSigninViaLdap, isPasswordWithLdapEnabled, methodErr := resolvePasswordSigninMethod(application, authForm.SigninMethod)
+			if methodErr != nil {
+				c.ResponseError(c.T(methodErr.Error()))
 				return
 			}
 
@@ -926,14 +948,6 @@ func (c *ApiController) Login() {
 					c.ResponseError(err.Error())
 					return
 				}
-			}
-
-			isSigninViaLdap := authForm.SigninMethod == "LDAP"
-			var isPasswordWithLdapEnabled bool
-			if authForm.SigninMethod == "Password" {
-				isPasswordWithLdapEnabled = application.IsPasswordWithLdapEnabled()
-			} else {
-				isPasswordWithLdapEnabled = false
 			}
 
 			if application.IsShared {

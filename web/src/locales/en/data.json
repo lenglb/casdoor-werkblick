@@ -73,6 +73,8 @@
     "Enable SAML assertion signature - Tooltip": "Whether to digitally sign the SAML assertion in addition to the SAML response",
     "Enable SAML compression": "Enable SAML compression",
     "Enable SAML compression - Tooltip": "Whether to compress SAML response messages when Casdoor is used as SAML idp",
+    "Enable SAML identity provider": "Enable SAML identity provider",
+    "Enable SAML identity provider - Tooltip": "Explicitly allow this tenant-bound application to issue SAML assertions to its exact registered reply URL",
     "Enable exclusive signin": "Enable exclusive signin",
     "Enable exclusive signin - Tooltip": "When exclusive signin enabled, user cannot have multiple active session",
     "Enable guest signin": "Enable guest signin",

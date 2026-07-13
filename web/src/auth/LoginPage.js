@@ -1367,6 +1367,8 @@ class LoginPage extends React.Component {
     this.populateOauthValues(values);
     const application = this.getApplicationObj();
     const webAuthnParams = AuthBackend.getWebAuthnSigninSearchParams(oAuthParams, values["type"]);
+    webAuthnParams.set("clientId", application.clientId);
+    webAuthnParams.set("signinMethod", "WebAuthn");
     const beginParams = new URLSearchParams(webAuthnParams);
     beginParams.set("owner", application.organization);
     if (username) {

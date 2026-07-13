@@ -17,6 +17,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 
 	"github.com/beego/beego/v2/core/logs"
 	"github.com/beego/beego/v2/server/web"
@@ -33,7 +35,76 @@ import (
 	"github.com/casdoor/casdoor/util"
 )
 
+const schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
+const bootstrapDataOnlyEnv = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+
+type startupMode string
+
+const (
+	startupModeNormal        startupMode = "normal"
+	startupModeSchemaOnly    startupMode = "schema-only"
+	startupModeBootstrapOnly startupMode = "bootstrap-data-only"
+)
+
+type startupHooks struct {
+	initAPI         func()
+	initFlag        func()
+	initAdapter     func()
+	createTables    func()
+	initDb          func()
+	initFromFile    func()
+	startNormalBoot func()
+}
+
+// runStartup deliberately accepts only the exact literal "true" for special
+// startup modes. Misspelled or unexpectedly formatted values stay on the
+// normal startup path instead of silently exiting a production service.
+func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks startupHooks) (startupMode, error) {
+	migrationOnly := migrationOnlyValue == "true"
+	bootstrapOnly := bootstrapOnlyValue == "true"
+	if migrationOnly && bootstrapOnly {
+		return "", fmt.Errorf("%s and %s are mutually exclusive", schemaMigrationOnlyEnv, bootstrapDataOnlyEnv)
+	}
+
+	hooks.initAPI()
+	hooks.initFlag()
+	hooks.initAdapter()
+	hooks.createTables()
+
+	if migrationOnly {
+		return startupModeSchemaOnly, nil
+	}
+	if bootstrapOnly {
+		hooks.initDb()
+		hooks.initFromFile()
+		return startupModeBootstrapOnly, nil
+	}
+
+	hooks.startNormalBoot()
+	return startupModeNormal, nil
+}
+
 func main() {
+	mode, err := runStartup(os.Getenv(schemaMigrationOnlyEnv), os.Getenv(bootstrapDataOnlyEnv), startupHooks{
+		initAPI:         routers.InitAPI,
+		initFlag:        object.InitFlag,
+		initAdapter:     object.InitAdapter,
+		createTables:    object.CreateTables,
+		initDb:          object.InitDb,
+		initFromFile:    object.InitFromFileRequired,
+		startNormalBoot: startNormalBoot,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	if mode == startupModeSchemaOnly {
+		log.Printf("schema migration completed; %s=true, exiting before service initialization", schemaMigrationOnlyEnv)
+	} else if mode == startupModeBootstrapOnly {
+		log.Printf("bootstrap data import completed; %s=true, exiting before service initialization", bootstrapDataOnlyEnv)
+	}
+}
+
+func startNormalBoot() {
 	web.BConfig.WebConfig.Session.SessionOn = true
 	web.BConfig.WebConfig.Session.SessionName = "casdoor_session_id"
 	if conf.GetConfigString("redisEndpoint") == "" {
@@ -50,11 +121,6 @@ func main() {
 	web.BConfig.WebConfig.Session.SessionCookieLifeTime = sessionCookieLifeTime
 	web.BConfig.WebConfig.Session.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
 	// web.BConfig.WebConfig.Session.SessionCookieSameSite = http.SameSiteNoneMode
-
-	routers.InitAPI()
-	object.InitFlag()
-	object.InitAdapter()
-	object.CreateTables()
 
 	object.InitDb()
 

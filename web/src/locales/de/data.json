@@ -72,6 +72,8 @@
     "Enable SAML assertion signature - Tooltip": "SAML-Assertion-Signatur aktivieren - Hinweis",
     "Enable SAML compression": "Aktivieren Sie SAML-Komprimierung",
     "Enable SAML compression - Tooltip": "Ob SAML-Antwortnachrichten komprimiert werden sollen, wenn Casdoor als SAML-IdP verwendet wird",
+    "Enable SAML identity provider": "SAML-Identity-Provider aktivieren",
+    "Enable SAML identity provider - Tooltip": "Erlaubt dieser mandantengebundenen Anwendung explizit, SAML-Assertions nur an die exakt hinterlegte Reply-URL auszustellen",
     "Enable exclusive signin": "Exklusive Anmeldung aktivieren",
     "Enable exclusive signin - Tooltip": "Wenn die exklusive Anmeldung aktiviert ist, kann der Benutzer nicht mehrere aktive Sitzungen haben",
     "Enable guest signin": "Gastanmeldung aktivieren",

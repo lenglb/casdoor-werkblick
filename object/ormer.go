@@ -127,6 +127,90 @@ func CreateTables() {
 	}
 
 	ormer.createTable()
+	if err := migrateWerkblickPostgresSchema(ormer); err != nil {
+		panic(err)
+	}
+}
+
+var werkblickPostgresFloatColumns = []string{"expire_in_hours", "refresh_expire_in_hours"}
+
+func postgresFloatColumnNeedsMigration(dataType string) (bool, error) {
+	switch dataType {
+	case "double precision":
+		return false, nil
+	case "smallint", "integer", "bigint":
+		return true, nil
+	case "":
+		return false, fmt.Errorf("column is missing")
+	default:
+		return false, fmt.Errorf("unsupported source type %q", dataType)
+	}
+}
+
+// migrateWerkblickPostgresSchema covers type changes that Xorm Sync2 detects
+// but intentionally does not execute. It is transactional and idempotent, and
+// rejects an unexpected source type instead of guessing at a destructive cast.
+func migrateWerkblickPostgresSchema(adapter *Ormer) error {
+	if adapter == nil || adapter.driverName != "postgres" {
+		return nil
+	}
+
+	applicationTable := adapter.Engine.TableName(new(Application))
+	quotedTable := adapter.Engine.Quote(adapter.Engine.TableName(new(Application), true))
+	session := adapter.Engine.NewSession()
+	defer session.Close()
+
+	if err := session.Begin(); err != nil {
+		return fmt.Errorf("begin Werkblick PostgreSQL schema migration: %w", err)
+	}
+	rollback := func(err error) error {
+		if rollbackErr := session.Rollback(); rollbackErr != nil {
+			return fmt.Errorf("%w (rollback failed: %v)", err, rollbackErr)
+		}
+		return err
+	}
+
+	for _, column := range werkblickPostgresFloatColumns {
+		rows, err := session.QueryString(
+			"SELECT data_type FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?",
+			applicationTable,
+			column,
+		)
+		if err != nil {
+			return rollback(fmt.Errorf("inspect %s.%s: %w", applicationTable, column, err))
+		}
+
+		dataType := ""
+		if len(rows) == 1 {
+			dataType = rows[0]["data_type"]
+		} else if len(rows) > 1 {
+			return rollback(fmt.Errorf("inspect %s.%s: found %d columns", applicationTable, column, len(rows)))
+		}
+
+		needsMigration, err := postgresFloatColumnNeedsMigration(dataType)
+		if err != nil {
+			return rollback(fmt.Errorf("cannot migrate %s.%s: %w", applicationTable, column, err))
+		}
+		if !needsMigration {
+			continue
+		}
+
+		quotedColumn := adapter.Engine.Quote(column)
+		statement := fmt.Sprintf(
+			"ALTER TABLE %s ALTER COLUMN %s TYPE double precision USING %s::double precision",
+			quotedTable,
+			quotedColumn,
+			quotedColumn,
+		)
+		if _, err = session.Exec(statement); err != nil {
+			return rollback(fmt.Errorf("migrate %s.%s to double precision: %w", applicationTable, column, err))
+		}
+	}
+
+	if err := session.Commit(); err != nil {
+		return fmt.Errorf("commit Werkblick PostgreSQL schema migration: %w", err)
+	}
+	return nil
 }
 
 // Ormer represents the MySQL adapter for policy storage.

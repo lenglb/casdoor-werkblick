@@ -165,11 +165,11 @@ func pkceChallenge(verifier string) string {
 	return base64.URLEncoding.WithPadding(base64.NoPadding).EncodeToString(sum[:])
 }
 
-// IsGrantTypeValid checks if grantType is allowed in the current application.
-// authorization_code is allowed by default.
+// IsGrantTypeValid checks if grantType is explicitly allowed in the current
+// application. An empty allowlist rejects every grant type.
 func IsGrantTypeValid(method string, grantTypes []string) bool {
-	if method == "authorization_code" {
-		return true
+	if method == "" {
+		return false
 	}
 	for _, m := range grantTypes {
 		if m == method {
@@ -188,17 +188,26 @@ func isRegexScope(scope string) bool {
 // against the application's configured scopes. Literal scopes are kept as-is
 // after verifying they exist in the allowed list. Regex scopes are matched
 // against every allowed scope name; all matches replace the pattern.
-// If the application has no defined scopes, the original scope string is
-// returned unchanged (backward-compatible behaviour).
+// If the application has no defined scopes, only an empty scope request is
+// accepted.
 // Returns the expanded scope string and whether the scope is valid.
 func IsScopeValidAndExpand(scope string, application *Application) (string, bool) {
-	if len(application.Scopes) == 0 || scope == "" {
+	if application == nil {
+		return "", false
+	}
+	if scope == "" {
 		return scope, true
+	}
+	if len(application.Scopes) == 0 {
+		return "", false
 	}
 
 	allowedNames := make([]string, 0, len(application.Scopes))
 	allowedSet := make(map[string]bool, len(application.Scopes))
 	for _, s := range application.Scopes {
+		if s == nil {
+			continue
+		}
 		allowedNames = append(allowedNames, s.Name)
 		allowedSet[s.Name] = true
 	}
@@ -247,8 +256,7 @@ func IsScopeValidAndExpand(scope string, application *Application) (string, bool
 
 // IsScopeValid checks whether all space-separated scopes in the scope string
 // are defined in the application's Scopes list (including regex expansion).
-// If the application has no defined scopes, every scope is considered valid
-// (backward-compatible behaviour).
+// If the application has no defined scopes, only an empty scope is valid.
 func IsScopeValid(scope string, application *Application) bool {
 	_, ok := IsScopeValidAndExpand(scope, application)
 	return ok

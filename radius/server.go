@@ -17,6 +17,7 @@ package radius
 import (
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -32,19 +33,28 @@ var StateMap map[string]AccessStateContent
 
 const StateExpiredTime = time.Second * 120
 
+var listenAndServeRadius = func(server *radius.PacketServer) error {
+	return server.ListenAndServe()
+}
+
 type AccessStateContent struct {
 	ExpiredAt time.Time
 }
 
 func StartRadiusServer() {
+	port, err := strconv.Atoi(conf.GetConfigString("radiusServerPort"))
+	if err != nil || port <= 0 || port > 65535 {
+		log.Printf("RADIUS server disabled: radiusServerPort must be between 1 and 65535")
+		return
+	}
 	secret := conf.GetConfigString("radiusSecret")
 	server := radius.PacketServer{
-		Addr:         "0.0.0.0:" + conf.GetConfigString("radiusServerPort"),
+		Addr:         fmt.Sprintf("0.0.0.0:%d", port),
 		Handler:      radius.HandlerFunc(handlerRadius),
 		SecretSource: radius.StaticSecretSource([]byte(secret)),
 	}
 	log.Printf("Starting Radius server on %s", server.Addr)
-	if err := server.ListenAndServe(); err != nil {
+	if err = listenAndServeRadius(&server); err != nil {
 		log.Printf("StartRadiusServer() failed, err = %v", err)
 	}
 }
@@ -65,7 +75,7 @@ func handleAccessRequest(w radius.ResponseWriter, r *radius.Request) {
 	password := rfc2865.UserPassword_GetString(r.Packet)
 	organization := rfc2865.Class_GetString(r.Packet)
 	state := rfc2865.State_GetString(r.Packet)
-	log.Printf("handleAccessRequest() username=%v, org=%v, password=%v", username, organization, password)
+	log.Printf("handleAccessRequest() username=%v, org=%v", username, organization)
 
 	if organization == "" {
 		organization = conf.GetConfigString("radiusDefaultOrganization")

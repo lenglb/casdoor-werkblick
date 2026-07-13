@@ -125,10 +125,18 @@ jobs:
           file: Dockerfile.werkblick
           platforms: linux/amd64
           push: false
+          load: true
           pull: true
           provenance: false
           sbom: false
+          tags: casdoor-werkblick-ci:${{ github.sha }}
           build-args: |
             SOURCE_DATE_EPOCH=${{ steps.source-date.outputs.epoch }}
           cache-from: type=gha,scope=werkblick-ci-image
           cache-to: type=gha,mode=max,scope=werkblick-ci-image
+
+      - name: Verify PostgreSQL 16 upgrade and migration-only exit
+        env:
+          WERKBLICK_CI_IMAGE: casdoor-werkblick-ci:${{ github.sha }}
+        shell: bash
+        run: scripts/verify-postgres-migration.sh "$WERKBLICK_CI_IMAGE"

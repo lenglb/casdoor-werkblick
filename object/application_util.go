@@ -263,6 +263,7 @@ func GetMaskedApplication(application *Application, userId string) *Application 
 	application.EnablePassword = false
 	application.EnableSigninSession = false
 	application.EnableCodeSignin = false
+	application.EnableSaml = false
 	application.EnableSamlCompress = false
 	application.EnableSamlC14n10 = false
 	application.EnableSamlPostBinding = false
@@ -448,7 +449,7 @@ func (application *Application) IsPasswordEnabled() bool {
 		return application.EnablePassword
 	} else {
 		for _, signinMethod := range application.SigninMethods {
-			if signinMethod.Name == "Password" {
+			if signinMethod != nil && signinMethod.Name == "Password" && signinMethod.Rule != "Hide password" {
 				return true
 			}
 		}

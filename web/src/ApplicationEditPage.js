@@ -193,7 +193,9 @@ class ApplicationEditPage extends React.Component {
 
         this.getCerts(application);
 
-        this.getSamlMetadata(application.enableSamlPostBinding);
+        if (application.enableSaml) {
+          this.getSamlMetadata(application.enableSamlPostBinding);
+        }
       });
   }
 
@@ -243,6 +245,12 @@ class ApplicationEditPage extends React.Component {
   }
 
   getSamlMetadata(checked) {
+    if (!this.state.application?.enableSaml) {
+      this.setState({
+        samlMetadata: null,
+      });
+      return;
+    }
     ApplicationBackend.getSamlMetadata("admin", this.state.applicationName, checked)
       .then((data) => {
         this.setState({
@@ -912,11 +920,24 @@ class ApplicationEditPage extends React.Component {
       {this.state.activeMenuKey === "saml" && (
         <React.Fragment>
           <Row style={{marginTop: "10px"}} >
+            <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 19 : 2}>
+              {Setting.getLabel(i18next.t("application:Enable SAML identity provider"), i18next.t("application:Enable SAML identity provider - Tooltip"))} :
+            </Col>
+            <Col span={1} >
+              <Switch checked={this.state.application.enableSaml} onChange={checked => {
+                this.updateApplicationField("enableSaml", checked);
+                if (!checked) {
+                  this.setState({samlMetadata: null});
+                }
+              }} />
+            </Col>
+          </Row>
+          <Row style={{marginTop: "10px"}} >
             <Col style={{marginTop: "5px"}} span={(Setting.isMobile()) ? 22 : 3}>
               {Setting.getLabel(i18next.t("application:SAML reply URL"), i18next.t("application:Redirect URL (Assertion Consumer Service POST Binding URL) - Tooltip"))} :
             </Col>
             <Col span={21} >
-              <Input prefix={<LinkOutlined />} value={this.state.application.samlReplyUrl} onChange={e => {
+              <Input disabled={!this.state.application.enableSaml} prefix={<LinkOutlined />} value={this.state.application.samlReplyUrl} onChange={e => {
                 this.updateApplicationField("samlReplyUrl", e.target.value);
               }} />
             </Col>
@@ -1048,7 +1069,7 @@ class ApplicationEditPage extends React.Component {
             <Col span={21}>
               <Editor value={this.state.samlMetadata?.toString() ?? ""} lang="xml" readOnly />
               <br />
-              <Button style={{marginBottom: "10px"}} type="primary" shape="round" icon={<CopyOutlined />} onClick={() => {
+              <Button disabled={!this.state.application.enableSaml} style={{marginBottom: "10px"}} type="primary" shape="round" icon={<CopyOutlined />} onClick={() => {
                 copy(`${window.location.origin}/api/saml/metadata?application=admin/${encodeURIComponent(this.state.applicationName)}&enablePostBinding=${this.state.application.enableSamlPostBinding}`);
                 Setting.showMessage("success", i18next.t("general:Copied to clipboard successfully"));
               }}

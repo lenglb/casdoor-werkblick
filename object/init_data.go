@@ -157,6 +157,21 @@ func InitFromFile() {
 	}
 }
 
+// InitFromFileRequired is used by the one-shot bootstrap mode. A successful
+// bootstrap must never be reported when the configured, mounted init-data file
+// is missing.
+func InitFromFileRequired() {
+	initDataFile := conf.GetConfigString("initDataFile")
+	if initDataFile == "" {
+		panic("initDataFile must be configured for bootstrap-data-only mode")
+	}
+	if !util.FileExist(initDataFile) {
+		panic("configured initDataFile does not exist for bootstrap-data-only mode")
+	}
+
+	InitFromFile()
+}
+
 func readInitDataFromFile(filePath string) (*InitData, error) {
 	if !util.FileExist(filePath) {
 		return nil, nil

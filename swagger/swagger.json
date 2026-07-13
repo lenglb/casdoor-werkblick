@@ -6558,6 +6558,12 @@
                         "type": "string"
                     },
                     {
+                        "in": "query",
+                        "name": "columns",
+                        "description": "Optional comma-separated role-specific allowlist of fields to update; unknown or sensitive fields are rejected",
+                        "type": "string"
+                    },
+                    {
                         "in": "body",
                         "name": "body",
                         "description": "The details of the user",
@@ -7286,6 +7292,10 @@
                 },
                 "enablePassword": {
                     "type": "boolean"
+                },
+                "enableSaml": {
+                    "type": "boolean",
+                    "default": false
                 },
                 "enableSamlAssertionSignature": {
                     "type": "boolean"

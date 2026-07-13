@@ -867,11 +867,16 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 			"yammer", "yandex", "zoom", "custom", "need_update_password", "ip_whitelist", "mfa_remember_deadline",
 			"cart", "application_scopes",
 		}
+		if isAdmin {
+			columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
+				"is_admin", "is_forbidden", "is_deleted")
+		}
 	}
-	if isAdmin {
-		columns = append(columns, "name", "id", "email", "phone", "country_code", "type", "balance", "balance_credit", "balance_currency", "mfa_items", "register_type", "register_source",
-			"is_admin", "is_forbidden", "is_deleted")
-	}
+
+	// Email ownership is purpose-verified. Whenever this update actually writes
+	// a different address, clear verification in the same SQL UPDATE. Generic
+	// callers cannot carry a previous address' trust to a new address.
+	columns = applyEmailVerificationInvariant(oldUser, user, columns)
 
 	columns = append(columns, "updated_time")
 	user.UpdatedTime = util.GetCurrentTime()
@@ -893,6 +898,18 @@ func UpdateUser(id string, user *User, columns []string, isAdmin bool) (bool, er
 	}
 
 	return affected != 0, nil
+}
+
+func applyEmailVerificationInvariant(oldUser, user *User, columns []string) []string {
+	if oldUser == nil || user == nil || !util.InSlice(columns, "email") || oldUser.Email == user.Email {
+		return columns
+	}
+
+	user.EmailVerified = false
+	if !util.InSlice(columns, "email_verified") {
+		columns = append(columns, "email_verified")
+	}
+	return columns
 }
 
 func updateUser(id string, user *User, columns []string) (int64, error) {
@@ -1270,8 +1287,9 @@ func GetUserInfo(user *User, scope string, aud string, host string) (*Userinfo, 
 
 	if strings.Contains(scope, "email") && allowed("Email") {
 		resp.Email = user.Email
-		// resp.EmailVerified = user.EmailVerified
-		resp.EmailVerified = true
+		// Consumers may use this claim for account linking, so only propagate the
+		// persisted result of Casdoor's verification flow.
+		resp.EmailVerified = user.EmailVerified
 	}
 
 	if strings.Contains(scope, "address") && allowed("Location") {

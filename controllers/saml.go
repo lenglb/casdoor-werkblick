@@ -57,6 +57,19 @@ func (c *ApiController) HandleSamlRedirect() {
 
 	owner := c.Ctx.Input.Param(":owner")
 	application := c.Ctx.Input.Param(":application")
+	applicationObj, err := object.GetApplication(fmt.Sprintf("%s/%s", owner, application))
+	if err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
+	if applicationObj == nil {
+		c.ResponseError(fmt.Sprintf(c.T("saml:Application %s not found"), fmt.Sprintf("%s/%s", owner, application)))
+		return
+	}
+	if err = object.ValidateSamlIdpApplication(applicationObj); err != nil {
+		c.ResponseError(err.Error())
+		return
+	}
 
 	relayState := c.Ctx.Input.Query("RelayState")
 	samlRequest := c.Ctx.Input.Query("SAMLRequest")
