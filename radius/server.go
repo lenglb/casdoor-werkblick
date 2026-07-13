@@ -32,11 +32,15 @@ import (
 	"layeh.com/radius/rfc2866"
 )
 
-var StateMap map[string]AccessStateContent
-var stateMapMutex sync.Mutex
+var (
+	StateMap      map[string]AccessStateContent
+	stateMapMutex sync.Mutex
+)
 
-const StateExpiredTime = time.Second * 120
-const MaxPendingAccessStates = 4096
+const (
+	StateExpiredTime       = time.Second * 120
+	MaxPendingAccessStates = 4096
+)
 
 var listenAndServeRadius = func(server *radius.PacketServer) error {
 	return server.ListenAndServe()

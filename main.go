@@ -35,8 +35,10 @@ import (
 	"github.com/casdoor/casdoor/util"
 )
 
-const schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
-const bootstrapDataOnlyEnv = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+const (
+	schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
+	bootstrapDataOnlyEnv   = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+)
 
 type startupMode string
 
@@ -47,13 +49,14 @@ const (
 )
 
 type startupHooks struct {
-	initAPI         func()
-	initFlag        func()
-	initAdapter     func()
-	createTables    func()
-	initDb          func()
-	initFromFile    func()
-	startNormalBoot func()
+	configureSession func()
+	initAPI          func()
+	initFlag         func()
+	initAdapter      func()
+	createTables     func()
+	initDb           func()
+	initFromFile     func()
+	startNormalBoot  func()
 }
 
 func parseStartupBoolean(name string, value string) (bool, error) {
@@ -83,6 +86,11 @@ func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks star
 		return "", fmt.Errorf("%s and %s are mutually exclusive", schemaMigrationOnlyEnv, bootstrapDataOnlyEnv)
 	}
 
+	if !migrationOnly && !bootstrapOnly {
+		// Beego snapshots SessionOn into each route as it is registered.
+		// Configure sessions before InitAPI so normal routes receive a store.
+		hooks.configureSession()
+	}
 	hooks.initAPI()
 	hooks.initFlag()
 	hooks.initAdapter()
@@ -103,13 +111,14 @@ func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks star
 
 func main() {
 	mode, err := runStartup(os.Getenv(schemaMigrationOnlyEnv), os.Getenv(bootstrapDataOnlyEnv), startupHooks{
-		initAPI:         routers.InitAPI,
-		initFlag:        object.InitFlag,
-		initAdapter:     object.InitAdapter,
-		createTables:    object.CreateTables,
-		initDb:          object.InitDb,
-		initFromFile:    object.InitFromFileRequired,
-		startNormalBoot: startNormalBoot,
+		configureSession: configureSession,
+		initAPI:          routers.InitAPI,
+		initFlag:         object.InitFlag,
+		initAdapter:      object.InitAdapter,
+		createTables:     object.CreateTables,
+		initDb:           object.InitDb,
+		initFromFile:     object.InitFromFileRequired,
+		startNormalBoot:  startNormalBoot,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -121,7 +130,7 @@ func main() {
 	}
 }
 
-func startNormalBoot() {
+func configureSession() {
 	web.BConfig.WebConfig.Session.SessionOn = true
 	web.BConfig.WebConfig.Session.SessionName = "casdoor_session_id"
 	if conf.GetConfigString("redisEndpoint") == "" {
@@ -138,7 +147,9 @@ func startNormalBoot() {
 	web.BConfig.WebConfig.Session.SessionCookieLifeTime = sessionCookieLifeTime
 	web.BConfig.WebConfig.Session.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
 	// web.BConfig.WebConfig.Session.SessionCookieSameSite = http.SameSiteNoneMode
+}
 
+func startNormalBoot() {
 	object.InitDb()
 
 	// Handle export command

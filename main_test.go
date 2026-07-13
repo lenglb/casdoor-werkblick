@@ -22,13 +22,14 @@ import (
 func TestSchemaMigrationOnlyStopsAfterCreateTables(t *testing.T) {
 	events := []string{}
 	hooks := startupHooks{
-		initAPI:         func() { events = append(events, "init-api") },
-		initFlag:        func() { events = append(events, "init-flag") },
-		initAdapter:     func() { events = append(events, "init-adapter") },
-		createTables:    func() { events = append(events, "create-tables") },
-		initDb:          func() { events = append(events, "init-db") },
-		initFromFile:    func() { events = append(events, "init-from-file") },
-		startNormalBoot: func() { events = append(events, "normal-boot") },
+		configureSession: func() { events = append(events, "configure-session") },
+		initAPI:          func() { events = append(events, "init-api") },
+		initFlag:         func() { events = append(events, "init-flag") },
+		initAdapter:      func() { events = append(events, "init-adapter") },
+		createTables:     func() { events = append(events, "create-tables") },
+		initDb:           func() { events = append(events, "init-db") },
+		initFromFile:     func() { events = append(events, "init-from-file") },
+		startNormalBoot:  func() { events = append(events, "normal-boot") },
 	}
 
 	mode, err := runStartup("true", "", hooks)
@@ -50,13 +51,14 @@ func TestSpecialStartupFlagsAcceptOnlyExplicitBooleanValues(t *testing.T) {
 		t.Run(value, func(t *testing.T) {
 			normalBootCalls := 0
 			hooks := startupHooks{
-				initAPI:         func() {},
-				initFlag:        func() {},
-				initAdapter:     func() {},
-				createTables:    func() {},
-				initDb:          func() {},
-				initFromFile:    func() {},
-				startNormalBoot: func() { normalBootCalls++ },
+				configureSession: func() {},
+				initAPI:          func() {},
+				initFlag:         func() {},
+				initAdapter:      func() {},
+				createTables:     func() {},
+				initDb:           func() {},
+				initFromFile:     func() {},
+				startNormalBoot:  func() { normalBootCalls++ },
 			}
 
 			mode, err := runStartup(value, value, hooks)
@@ -89,13 +91,14 @@ func TestInvalidSpecialStartupFlagsFailBeforeInitialization(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			events := []string{}
 			hooks := startupHooks{
-				initAPI:         func() { events = append(events, "init-api") },
-				initFlag:        func() { events = append(events, "init-flag") },
-				initAdapter:     func() { events = append(events, "init-adapter") },
-				createTables:    func() { events = append(events, "create-tables") },
-				initDb:          func() { events = append(events, "init-db") },
-				initFromFile:    func() { events = append(events, "init-from-file") },
-				startNormalBoot: func() { events = append(events, "normal-boot") },
+				configureSession: func() { events = append(events, "configure-session") },
+				initAPI:          func() { events = append(events, "init-api") },
+				initFlag:         func() { events = append(events, "init-flag") },
+				initAdapter:      func() { events = append(events, "init-adapter") },
+				createTables:     func() { events = append(events, "create-tables") },
+				initDb:           func() { events = append(events, "init-db") },
+				initFromFile:     func() { events = append(events, "init-from-file") },
+				startNormalBoot:  func() { events = append(events, "normal-boot") },
 			}
 
 			mode, err := runStartup(test.migration, test.bootstrap, hooks)
@@ -115,13 +118,14 @@ func TestInvalidSpecialStartupFlagsFailBeforeInitialization(t *testing.T) {
 func TestBootstrapDataOnlyHasIsolatedCallOrder(t *testing.T) {
 	events := []string{}
 	hooks := startupHooks{
-		initAPI:         func() { events = append(events, "init-api") },
-		initFlag:        func() { events = append(events, "init-flag") },
-		initAdapter:     func() { events = append(events, "init-adapter") },
-		createTables:    func() { events = append(events, "create-tables") },
-		initDb:          func() { events = append(events, "init-db") },
-		initFromFile:    func() { events = append(events, "init-from-file") },
-		startNormalBoot: func() { events = append(events, "normal-boot") },
+		configureSession: func() { events = append(events, "configure-session") },
+		initAPI:          func() { events = append(events, "init-api") },
+		initFlag:         func() { events = append(events, "init-flag") },
+		initAdapter:      func() { events = append(events, "init-adapter") },
+		createTables:     func() { events = append(events, "create-tables") },
+		initDb:           func() { events = append(events, "init-db") },
+		initFromFile:     func() { events = append(events, "init-from-file") },
+		startNormalBoot:  func() { events = append(events, "normal-boot") },
 	}
 
 	mode, err := runStartup("", "true", hooks)
@@ -138,16 +142,44 @@ func TestBootstrapDataOnlyHasIsolatedCallOrder(t *testing.T) {
 	}
 }
 
+func TestNormalStartupConfiguresSessionBeforeRoutes(t *testing.T) {
+	events := []string{}
+	hooks := startupHooks{
+		configureSession: func() { events = append(events, "configure-session") },
+		initAPI:          func() { events = append(events, "init-api") },
+		initFlag:         func() { events = append(events, "init-flag") },
+		initAdapter:      func() { events = append(events, "init-adapter") },
+		createTables:     func() { events = append(events, "create-tables") },
+		initDb:           func() { events = append(events, "init-db") },
+		initFromFile:     func() { events = append(events, "init-from-file") },
+		startNormalBoot:  func() { events = append(events, "normal-boot") },
+	}
+
+	mode, err := runStartup("", "", hooks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mode != startupModeNormal {
+		t.Fatalf("startup mode = %q, want normal", mode)
+	}
+
+	want := []string{"configure-session", "init-api", "init-flag", "init-adapter", "create-tables", "normal-boot"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("startup events = %v, want %v", events, want)
+	}
+}
+
 func TestSpecialStartupModesAreMutuallyExclusive(t *testing.T) {
 	events := []string{}
 	hooks := startupHooks{
-		initAPI:         func() { events = append(events, "init-api") },
-		initFlag:        func() { events = append(events, "init-flag") },
-		initAdapter:     func() { events = append(events, "init-adapter") },
-		createTables:    func() { events = append(events, "create-tables") },
-		initDb:          func() { events = append(events, "init-db") },
-		initFromFile:    func() { events = append(events, "init-from-file") },
-		startNormalBoot: func() { events = append(events, "normal-boot") },
+		configureSession: func() { events = append(events, "configure-session") },
+		initAPI:          func() { events = append(events, "init-api") },
+		initFlag:         func() { events = append(events, "init-flag") },
+		initAdapter:      func() { events = append(events, "init-adapter") },
+		createTables:     func() { events = append(events, "create-tables") },
+		initDb:           func() { events = append(events, "init-db") },
+		initFromFile:     func() { events = append(events, "init-from-file") },
+		startNormalBoot:  func() { events = append(events, "normal-boot") },
 	}
 
 	mode, err := runStartup("true", "true", hooks)
