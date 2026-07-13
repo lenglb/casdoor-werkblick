@@ -4803,6 +4803,13 @@
                         "description": "OAuth code",
                         "required": true,
                         "type": "string"
+                    },
+                    {
+                        "in": "query",
+                        "name": "redirect_uri",
+                        "description": "Exact redirect URI from the authorization request",
+                        "required": true,
+                        "type": "string"
                     }
                 ],
                 "responses": {

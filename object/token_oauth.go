@@ -183,12 +183,11 @@ func getOAuthToken(grantType string, clientId string, clientSecret string, code 
 	// consumption. Token exchange mints its output with cnf directly. Other
 	// grants replace the just-issued signed credentials and DB marker together.
 	if dpopJkt != "" && grantType != "authorization_code" && grantType != "urn:ietf:params:oauth:grant-type:token-exchange" {
-		if tokenError, err = bindIssuedTokenToDPoP(application, token, dpopJkt, host); err != nil {
-			abortDeviceAuthTokenIssuance(deviceCode, claimedDeviceAuth, token)
+		tokenError, err = bindIssuedTokenToDPoPWithCleanup(application, token, dpopJkt, host, deviceCode, claimedDeviceAuth)
+		if err != nil {
 			return nil, err
 		}
 		if tokenError != nil {
-			abortDeviceAuthTokenIssuance(deviceCode, claimedDeviceAuth, token)
 			return tokenError, nil
 		}
 	}
@@ -230,21 +229,60 @@ func deviceAuthTokenClaimError(result DeviceAuthTokenClaimResult) *TokenError {
 	}
 }
 
+func deleteIssuedTokenForFailedIssuance(token *Token) error {
+	if token == nil {
+		return fmt.Errorf("issued token is missing")
+	}
+	deleted, err := DeleteToken(token)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return fmt.Errorf("issued token no longer matches a persisted row")
+	}
+	return nil
+}
+
 // abortDeviceAuthTokenIssuance rolls an exclusive claim back only when no
 // usable token row remains. If cleanup of an already-minted row fails, the
 // status deliberately stays token_issuing so a retry cannot create a second
 // token family.
-func abortDeviceAuthTokenIssuance(deviceCode string, claimed *DeviceAuthCache, token *Token) {
+func abortDeviceAuthTokenIssuance(deviceCode string, claimed *DeviceAuthCache, token *Token) error {
 	if claimed == nil {
-		return
+		return nil
 	}
 	if token != nil {
-		deleted, err := DeleteToken(token)
-		if err != nil || !deleted {
-			return
+		if err := deleteIssuedTokenForFailedIssuance(token); err != nil {
+			return err
 		}
 	}
-	RollbackDeviceAuthTokenIssuance(deviceCode, claimed.ApplicationId, claimed.ClientId)
+	if !RollbackDeviceAuthTokenIssuance(deviceCode, claimed.ApplicationId, claimed.ClientId) {
+		return fmt.Errorf("device authorization issuance could not be rolled back")
+	}
+	return nil
+}
+
+func cleanupFailedPostMintDPoPBinding(deviceCode string, claimed *DeviceAuthCache, token *Token) error {
+	if claimed != nil {
+		return abortDeviceAuthTokenIssuance(deviceCode, claimed, token)
+	}
+	return deleteIssuedTokenForFailedIssuance(token)
+}
+
+func bindIssuedTokenToDPoPWithCleanup(application *Application, token *Token, dpopJkt string, host string, deviceCode string, claimed *DeviceAuthCache) (*TokenError, error) {
+	tokenError, err := bindIssuedTokenToDPoP(application, token, dpopJkt, host)
+	if err == nil && tokenError == nil {
+		return nil, nil
+	}
+
+	cleanupErr := cleanupFailedPostMintDPoPBinding(deviceCode, claimed, token)
+	if cleanupErr != nil {
+		if err != nil {
+			return nil, fmt.Errorf("DPoP binding failed: %v; issued bearer token cleanup failed: %w", err, cleanupErr)
+		}
+		return nil, fmt.Errorf("DPoP binding was rejected: %s; issued bearer token cleanup failed: %w", tokenError.ErrorDescription, cleanupErr)
+	}
+	return tokenError, err
 }
 
 func bindIssuedTokenToDPoP(application *Application, token *Token, dpopJkt string, host string) (*TokenError, error) {

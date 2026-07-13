@@ -41,7 +41,7 @@ func setupTokenSecurityTestOrmer(t *testing.T) {
 		t.Fatalf("create SQLite adapter: %v", err)
 	}
 	testOrmer.Engine.SetMaxOpenConns(8)
-	if err = testOrmer.Engine.Sync2(new(Token), new(User), new(Organization), new(Permission)); err != nil {
+	if err = testOrmer.Engine.Sync2(new(Token), new(User), new(Organization), new(Permission), new(Role), new(Application), new(Cert), new(Syncer), new(ThirdPartyLink)); err != nil {
 		testOrmer.close()
 		t.Fatalf("create token security tables: %v", err)
 	}
@@ -884,5 +884,192 @@ func TestGuestAuthorizationRevalidatesAccessAndMfaBeforeCreatingUser(t *testing.
 				t.Fatalf("denied guest authorization created %d users: %v", count, countErr)
 			}
 		})
+	}
+}
+
+func TestGuestAuthorizationHappyPathPersistsBoundUserAndToken(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	certificate, privateKey, err := generateRsaKeys(2048, 512, 20, "guest-test-cert", "security-test")
+	if err != nil {
+		t.Fatalf("generate guest signing key: %v", err)
+	}
+	cert := &Cert{
+		Owner:       "admin",
+		Name:        "guest-test-cert",
+		Certificate: certificate,
+		PrivateKey:  privateKey,
+	}
+	if _, err = ormer.Engine.Insert(cert); err != nil {
+		t.Fatalf("insert guest signing certificate: %v", err)
+	}
+	application := &Application{
+		Owner:                "admin",
+		Name:                 "guest-app",
+		Organization:         tokenSecurityOrganization,
+		ClientId:             "guest-client",
+		ClientSecret:         "guest-secret",
+		Cert:                 cert.Name,
+		ExpireInHours:        1,
+		RefreshExpireInHours: 1,
+		GrantTypes:           []string{"authorization_code"},
+		RedirectUris:         []string{tokenSecurityRedirect},
+		EnableGuestSignin:    true,
+		EnableSignUp:         true,
+	}
+	if _, err = ormer.Engine.Insert(application); err != nil {
+		t.Fatalf("insert guest application: %v", err)
+	}
+
+	token, tokenError, err := GetAuthorizationCodeTokenWithRedirectUri(
+		application,
+		application.ClientSecret,
+		"guest-user",
+		"",
+		tokenSecurityRedirect,
+		"",
+	)
+	if err != nil || tokenError != nil {
+		t.Fatalf("guest authorization = (%#v, %v)", tokenError, err)
+	}
+	if token == nil || token.Subject == "" || token.RedirectUri != tokenSecurityRedirect {
+		t.Fatalf("guest token is missing immutable redirect binding: %#v", token)
+	}
+
+	guestUser, err := getUser(token.Organization, token.User)
+	if err != nil {
+		t.Fatalf("reload guest user: %v", err)
+	}
+	if guestUser == nil || guestUser.Id == "" || guestUser.Id != token.Subject || guestUser.Tag != "guest-user" {
+		t.Fatalf("persisted guest user does not match token subject: %#v", guestUser)
+	}
+	authenticationContext, err := token.GetAuthenticationContext()
+	if err != nil {
+		t.Fatalf("read guest authentication context: %v", err)
+	}
+	if authenticationContext.Subject != guestUser.GetId() || authenticationContext.AuthTime <= 0 || len(authenticationContext.Amr) != 1 || authenticationContext.Amr[0] != "guest" {
+		t.Fatalf("guest authentication context is incomplete: %#v", authenticationContext)
+	}
+
+	persistedToken, err := getToken(token.Owner, token.Name)
+	if err != nil {
+		t.Fatalf("reload guest token: %v", err)
+	}
+	if persistedToken == nil || persistedToken.Subject != guestUser.Id || persistedToken.RedirectUri != tokenSecurityRedirect {
+		t.Fatalf("persisted guest token lost subject or redirect binding: %#v", persistedToken)
+	}
+	persistedContext, err := persistedToken.GetAuthenticationContext()
+	if err != nil || persistedContext.Subject != guestUser.GetId() || len(persistedContext.Amr) != 1 || persistedContext.Amr[0] != "guest" {
+		t.Fatalf("persisted guest authentication context = (%#v, %v)", persistedContext, err)
+	}
+}
+
+func TestFailedPostMintDPoPBindingDeletesIssuedBearerToken(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	application := &Application{
+		Owner:        "admin",
+		Name:         "different-application",
+		Organization: tokenSecurityOrganization,
+		GrantTypes:   []string{"password"},
+	}
+	token := &Token{
+		Owner:        "admin",
+		Name:         "failed-dpop-binding",
+		Application:  "security-test-app",
+		Organization: tokenSecurityOrganization,
+		User:         "alice",
+		Subject:      tokenSecurityUserID,
+		AccessToken:  "unreturned-bearer-token",
+		TokenType:    "Bearer",
+		GrantType:    "password",
+		ExpiresIn:    3600,
+	}
+	if _, err := AddToken(token); err != nil {
+		t.Fatalf("persist issued bearer token: %v", err)
+	}
+
+	tokenError, err := bindIssuedTokenToDPoPWithCleanup(application, token, "test-dpop-thumbprint", "", "", nil)
+	if err != nil {
+		t.Fatalf("failed DPoP binding returned internal error: %v", err)
+	}
+	if tokenError == nil || tokenError.Error != InvalidGrant {
+		t.Fatalf("failed DPoP binding error = %#v, want invalid_grant", tokenError)
+	}
+	persisted, err := getToken(token.Owner, token.Name)
+	if err != nil {
+		t.Fatalf("reload cleaned token: %v", err)
+	}
+	if persisted != nil {
+		t.Fatalf("failed DPoP binding left a persisted bearer token: %#v", persisted)
+	}
+}
+
+func TestFailedPostMintDPoPBindingCleanupFailsClosed(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	application := &Application{
+		Owner:        "admin",
+		Name:         "different-application",
+		Organization: tokenSecurityOrganization,
+		GrantTypes:   []string{"password"},
+	}
+	token := &Token{
+		Owner:        "admin",
+		Name:         "missing-issued-token",
+		Organization: tokenSecurityOrganization,
+	}
+	if tokenError, err := bindIssuedTokenToDPoPWithCleanup(application, token, "test-dpop-thumbprint", "", "", nil); err == nil || tokenError != nil {
+		t.Fatal("missing issued token row was treated as successfully cleaned")
+	}
+}
+
+func TestFailedDeviceDPoPBindingOnlyAllowsRetryAfterTokenCleanup(t *testing.T) {
+	setupTokenSecurityTestOrmer(t)
+	previousStore := DeviceAuthMap
+	store := &memoryDeviceAuthStore{}
+	DeviceAuthMap = store
+	t.Cleanup(func() { DeviceAuthMap = previousStore })
+
+	now := time.Now()
+	cache := approvedDeviceAuthCache(now)
+	store.Store("retryable-device-code", cache)
+	claimed, result := ClaimDeviceAuthTokenIssuance("retryable-device-code", cache.ApplicationId, cache.ClientId, now.Add(time.Second))
+	if result != DeviceAuthTokenClaimed {
+		t.Fatalf("device claim = %q, want %q", result, DeviceAuthTokenClaimed)
+	}
+	token := &Token{
+		Owner:        "admin",
+		Name:         "failed-device-dpop-binding",
+		Application:  "device-app",
+		Organization: tokenSecurityOrganization,
+		User:         "alice",
+		Subject:      tokenSecurityUserID,
+		AccessToken:  "unreturned-device-bearer",
+		TokenType:    "Bearer",
+		GrantType:    "urn:ietf:params:oauth:grant-type:device_code",
+		ExpiresIn:    3600,
+	}
+	if _, err := AddToken(token); err != nil {
+		t.Fatalf("persist device bearer token: %v", err)
+	}
+	if err := cleanupFailedPostMintDPoPBinding("retryable-device-code", &claimed, token); err != nil {
+		t.Fatalf("cleanup device DPoP failure: %v", err)
+	}
+	if persisted, err := getToken(token.Owner, token.Name); err != nil || persisted != nil {
+		t.Fatalf("device cleanup left token = (%#v, %v)", persisted, err)
+	}
+	if _, result = ClaimDeviceAuthTokenIssuance("retryable-device-code", cache.ApplicationId, cache.ClientId, now.Add(2*time.Second)); result != DeviceAuthTokenClaimed {
+		t.Fatalf("device retry after cleanup = %q, want %q", result, DeviceAuthTokenClaimed)
+	}
+
+	store.Store("locked-device-code", cache)
+	lockedClaim, result := ClaimDeviceAuthTokenIssuance("locked-device-code", cache.ApplicationId, cache.ClientId, now.Add(time.Second))
+	if result != DeviceAuthTokenClaimed {
+		t.Fatalf("locked device claim = %q, want %q", result, DeviceAuthTokenClaimed)
+	}
+	missingToken := &Token{Owner: "admin", Name: "missing-device-token", Organization: tokenSecurityOrganization}
+	if err := cleanupFailedPostMintDPoPBinding("locked-device-code", &lockedClaim, missingToken); err == nil {
+		t.Fatal("missing device token row was treated as successfully cleaned")
+	}
+	if _, result = ClaimDeviceAuthTokenIssuance("locked-device-code", cache.ApplicationId, cache.ClientId, now.Add(2*time.Second)); result != DeviceAuthTokenIssuanceInProgress {
+		t.Fatalf("device retry after cleanup failure = %q, want %q", result, DeviceAuthTokenIssuanceInProgress)
 	}
 }

@@ -46,6 +46,7 @@ type AccessStateContent struct {
 	ExpiredAt time.Time
 	Owner     string
 	User      string
+	Subject   string
 }
 
 type accessRequestDependencies struct {
@@ -88,7 +89,10 @@ func StartRadiusServer() {
 	}
 }
 
-func issueAccessState(owner string, user string, now time.Time) (string, error) {
+func issueAccessState(owner string, user string, subject string, now time.Time) (string, error) {
+	if subject == "" {
+		return "", fmt.Errorf("RADIUS MFA challenge requires an immutable user subject")
+	}
 	random := make([]byte, 32)
 	if _, err := rand.Read(random); err != nil {
 		return "", err
@@ -112,24 +116,32 @@ func issueAccessState(owner string, user string, now time.Time) (string, error) 
 		ExpiredAt: now.Add(StateExpiredTime),
 		Owner:     owner,
 		User:      user,
+		Subject:   subject,
 	}
 	return state, nil
 }
 
-func consumeAccessState(state string, owner string, user string, now time.Time) bool {
+func consumeAccessState(state string, owner string, user string, now time.Time) (string, bool) {
 	if state == "" {
-		return false
+		return "", false
 	}
 	stateMapMutex.Lock()
 	defer stateMapMutex.Unlock()
 	stateContent, ok := StateMap[state]
 	if !ok {
-		return false
+		return "", false
 	}
 	// Every presented state is consumed, including expired or cross-user
 	// attempts, so a captured value can never be replayed after probing.
 	delete(StateMap, state)
-	return stateContent.ExpiredAt.After(now) && stateContent.Owner == owner && stateContent.User == user
+	valid := stateContent.ExpiredAt.After(now) &&
+		stateContent.Owner == owner &&
+		stateContent.User == user &&
+		stateContent.Subject != ""
+	if !valid {
+		return "", false
+	}
+	return stateContent.Subject, true
 }
 
 func handlerRadius(w radius.ResponseWriter, r *radius.Request) {
@@ -163,11 +175,14 @@ func handleAccessRequestWithDependencies(w radius.ResponseWriter, r *radius.Requ
 
 	var user *object.User
 	var err error
+	stateSubject := ""
 
 	if state == "" {
 		user, err = dependencies.checkUserPassword(organization, username, password, "en")
 	} else {
-		if !consumeAccessState(state, organization, username, dependencies.now()) {
+		var stateValid bool
+		stateSubject, stateValid = consumeAccessState(state, organization, username, dependencies.now())
+		if !stateValid {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
@@ -179,7 +194,7 @@ func handleAccessRequestWithDependencies(w radius.ResponseWriter, r *radius.Requ
 		return
 	}
 	if state != "" {
-		if user.IsDeleted || user.IsForbidden || !user.IsMfaEnabled() {
+		if user.Id == "" || user.Id != stateSubject || user.IsDeleted || user.IsForbidden || !user.IsMfaEnabled() {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return
 		}
@@ -204,7 +219,7 @@ func handleAccessRequestWithDependencies(w radius.ResponseWriter, r *radius.Requ
 			return
 		}
 
-		responseState, stateErr := issueAccessState(organization, username, dependencies.now())
+		responseState, stateErr := issueAccessState(organization, username, user.Id, dependencies.now())
 		if stateErr != nil {
 			w.Write(r.Response(radius.CodeAccessReject))
 			return

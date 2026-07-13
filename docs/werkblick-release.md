@@ -116,6 +116,15 @@ enabled; a missing required-MFA enrollment also fails closed. Ordinary OIDC
 users without MFA remain AAL1-compatible, including users whose truthful
 `email_verified` claim is `false`.
 
+HTTP and generated-API clients redeeming an authorization code must now send
+`redirect_uri`. Go callers must migrate from `GetOAuthToken` to
+`GetOAuthTokenWithRedirectUri`, and from `GetAuthorizationCodeToken` or
+`GetAuthorizationCodeTokenForHost` to
+`GetAuthorizationCodeTokenWithRedirectUri` or
+`GetAuthorizationCodeTokenForHostAndRedirectUri`. The legacy helpers remain
+available for source compatibility, but authorization-code redemption through
+them intentionally fails closed.
+
 ### Schema-only migration
 
 Run the new image once with the exact environment value

@@ -158,6 +158,7 @@ func (c *ApiController) DeleteToken() {
 // @Param   client_id     query    string  true        "OAuth client id"
 // @Param   client_secret     query    string  true        "OAuth client secret"
 // @Param   code     query    string  true        "OAuth code"
+// @Param   redirect_uri     query    string  true        "Exact redirect URI from the authorization request"
 // @Success 200 {object} object.TokenWrapper The Response object
 // @Success 400 {object} object.TokenError The Response object
 // @Success 401 {object} object.TokenError The Response object

@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/casdoor/casdoor/object"
+	"github.com/pquerna/otp/totp"
 	radiuslib "layeh.com/radius"
 	"layeh.com/radius/rfc2865"
 )
@@ -147,33 +148,36 @@ func resetAccessStatesForTest(t *testing.T) {
 func TestAccessStateIsBoundToOrganizationAndUserAndConsumedOnFailure(t *testing.T) {
 	resetAccessStatesForTest(t)
 	now := time.Unix(1_750_000_000, 0)
-	state, err := issueAccessState("org-a", "alice", now)
+	state, err := issueAccessState("org-a", "alice", "subject-alice", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumeAccessState(state, "org-b", "alice", now) {
+	if _, accepted := consumeAccessState(state, "org-b", "alice", now); accepted {
 		t.Fatal("cross-organization RADIUS state was accepted")
 	}
-	if consumeAccessState(state, "org-a", "alice", now) {
+	if _, accepted := consumeAccessState(state, "org-a", "alice", now); accepted {
 		t.Fatal("state survived a failed cross-organization attempt")
 	}
 
-	state, err = issueAccessState("org-a", "alice", now)
+	state, err = issueAccessState("org-a", "alice", "subject-alice", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumeAccessState(state, "org-a", "bob", now) {
+	if _, accepted := consumeAccessState(state, "org-a", "bob", now); accepted {
 		t.Fatal("cross-user RADIUS state was accepted")
 	}
-	if consumeAccessState("arbitrary-client-state", "org-a", "no-mfa-user", now) {
+	if _, accepted := consumeAccessState("arbitrary-client-state", "org-a", "no-mfa-user", now); accepted {
 		t.Fatal("arbitrary state was accepted")
+	}
+	if state, err = issueAccessState("org-a", "alice", "", now); err == nil || state != "" {
+		t.Fatalf("challenge without immutable subject = (%q, %v), want rejection", state, err)
 	}
 }
 
 func TestAccessStateIsOneTimeUnderConcurrency(t *testing.T) {
 	resetAccessStatesForTest(t)
 	now := time.Unix(1_750_000_000, 0)
-	state, err := issueAccessState("org-a", "alice", now)
+	state, err := issueAccessState("org-a", "alice", "subject-alice", now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +191,7 @@ func TestAccessStateIsOneTimeUnderConcurrency(t *testing.T) {
 		go func() {
 			defer waitGroup.Done()
 			<-start
-			if consumeAccessState(state, "org-a", "alice", now) {
+			if subject, ok := consumeAccessState(state, "org-a", "alice", now); ok && subject == "subject-alice" {
 				accepted.Add(1)
 			}
 		}()
@@ -202,14 +206,14 @@ func TestAccessStateIsOneTimeUnderConcurrency(t *testing.T) {
 func TestExpiredAccessStateIsRejectedAndConsumed(t *testing.T) {
 	resetAccessStatesForTest(t)
 	now := time.Unix(1_750_000_000, 0)
-	state, err := issueAccessState("org-a", "alice", now)
+	state, err := issueAccessState("org-a", "alice", "subject-alice", now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumeAccessState(state, "org-a", "alice", now.Add(StateExpiredTime+time.Second)) {
+	if _, accepted := consumeAccessState(state, "org-a", "alice", now.Add(StateExpiredTime+time.Second)); accepted {
 		t.Fatal("expired RADIUS state was accepted")
 	}
-	if consumeAccessState(state, "org-a", "alice", now) {
+	if _, accepted := consumeAccessState(state, "org-a", "alice", now); accepted {
 		t.Fatal("expired state survived its first presentation")
 	}
 }
@@ -224,11 +228,12 @@ func TestPendingAccessStateStoreIsBoundedAndFailsClosed(t *testing.T) {
 			ExpiredAt: now.Add(StateExpiredTime),
 			Owner:     "org-a",
 			User:      "alice",
+			Subject:   "subject-alice",
 		}
 	}
 	stateMapMutex.Unlock()
 
-	if state, err := issueAccessState("org-a", "alice", now); err == nil || state != "" {
+	if state, err := issueAccessState("org-a", "alice", "subject-alice", now); err == nil || state != "" {
 		t.Fatalf("full RADIUS state store issued challenge (%q, %v)", state, err)
 	}
 }
@@ -236,7 +241,7 @@ func TestPendingAccessStateStoreIsBoundedAndFailsClosed(t *testing.T) {
 func TestMfaPasswordStepWritesExactlyOneChallengeAndNeverAccepts(t *testing.T) {
 	resetAccessStatesForTest(t)
 	now := time.Unix(1_750_000_000, 0)
-	user := &object.User{Owner: "org-a", Name: "alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
+	user := &object.User{Owner: "org-a", Name: "alice", Id: "subject-alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
 	dependencies := accessRequestDependencies{
 		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
 			if organization != user.Owner || username != user.Name || password != "correct-password" || lang != "en" {
@@ -274,8 +279,8 @@ func TestMfaPasswordStepWritesExactlyOneChallengeAndNeverAccepts(t *testing.T) {
 func TestMfaOtpFailureWritesExactlyOneRejectAndNeverAccepts(t *testing.T) {
 	resetAccessStatesForTest(t)
 	now := time.Unix(1_750_000_000, 0)
-	user := &object.User{Owner: "org-a", Name: "alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
-	state, err := issueAccessState(user.Owner, user.Name, now)
+	user := &object.User{Owner: "org-a", Name: "alice", Id: "subject-alice", TotpSecret: "JBSWY3DPEHPK3PXP"}
+	state, err := issueAccessState(user.Owner, user.Name, user.Id, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +310,7 @@ func TestMfaOtpFailureWritesExactlyOneRejectAndNeverAccepts(t *testing.T) {
 	if writer.packets[0].Code != radiuslib.CodeAccessReject {
 		t.Fatalf("RADIUS OTP failure response = %v, want Access-Reject", writer.packets[0].Code)
 	}
-	if consumeAccessState(state, user.Owner, user.Name, now) {
+	if _, accepted := consumeAccessState(state, user.Owner, user.Name, now); accepted {
 		t.Fatal("failed RADIUS OTP left its one-time state replayable")
 	}
 }
@@ -316,10 +321,11 @@ func TestMfaOtpStepRevalidatesDisabledUserBeforeVerification(t *testing.T) {
 	user := &object.User{
 		Owner:       "org-a",
 		Name:        "alice",
+		Id:          "subject-alice",
 		TotpSecret:  "JBSWY3DPEHPK3PXP",
 		IsForbidden: true,
 	}
-	state, err := issueAccessState(user.Owner, user.Name, now)
+	state, err := issueAccessState(user.Owner, user.Name, user.Id, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,5 +346,78 @@ func TestMfaOtpStepRevalidatesDisabledUserBeforeVerification(t *testing.T) {
 
 	if len(writer.packets) != 1 || writer.packets[0].Code != radiuslib.CodeAccessReject {
 		t.Fatalf("disabled RADIUS user responses = %#v, want one Access-Reject", writer.packets)
+	}
+}
+
+func TestMfaOtpStepAcceptsSameImmutableUserWithValidOtp(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	const secret = "JBSWY3DPEHPK3PXP"
+	user := &object.User{Owner: "org-a", Name: "alice", Id: "subject-alice", TotpSecret: secret}
+	state, err := issueAccessState(user.Owner, user.Name, user.Id, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passcode, err := totp.GenerateCode(secret, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := accessRequestDependencies{
+		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+			return nil, fmt.Errorf("password verification must not run during the OTP step")
+		},
+		getUser: func(id string) (*object.User, error) { return user, nil },
+		now:     func() time.Time { return now },
+	}
+
+	writer := &recordingRadiusResponseWriter{}
+	handleAccessRequestWithDependencies(
+		writer,
+		newRadiusAccessRequest(t, user.Owner, user.Name, passcode, state),
+		dependencies,
+	)
+
+	if len(writer.packets) != 1 || writer.packets[0].Code != radiuslib.CodeAccessAccept {
+		t.Fatalf("matching RADIUS user responses = %#v, want one Access-Accept", writer.packets)
+	}
+	if _, accepted := consumeAccessState(state, user.Owner, user.Name, now); accepted {
+		t.Fatal("successful RADIUS OTP left its one-time state replayable")
+	}
+}
+
+func TestMfaOtpStepRejectsRecreatedUserWithValidOtp(t *testing.T) {
+	resetAccessStatesForTest(t)
+	now := time.Unix(1_750_000_000, 0)
+	const secret = "JBSWY3DPEHPK3PXP"
+	originalUser := &object.User{Owner: "org-a", Name: "alice", Id: "original-subject", TotpSecret: secret}
+	replacementUser := &object.User{Owner: originalUser.Owner, Name: originalUser.Name, Id: "replacement-subject", TotpSecret: secret}
+	state, err := issueAccessState(originalUser.Owner, originalUser.Name, originalUser.Id, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	passcode, err := totp.GenerateCode(secret, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dependencies := accessRequestDependencies{
+		checkUserPassword: func(organization string, username string, password string, lang string) (*object.User, error) {
+			return nil, fmt.Errorf("password verification must not run during the OTP step")
+		},
+		getUser: func(id string) (*object.User, error) { return replacementUser, nil },
+		now:     func() time.Time { return now },
+	}
+
+	writer := &recordingRadiusResponseWriter{}
+	handleAccessRequestWithDependencies(
+		writer,
+		newRadiusAccessRequest(t, originalUser.Owner, originalUser.Name, passcode, state),
+		dependencies,
+	)
+
+	if len(writer.packets) != 1 || writer.packets[0].Code != radiuslib.CodeAccessReject {
+		t.Fatalf("recreated RADIUS user responses = %#v, want one Access-Reject", writer.packets)
+	}
+	if _, accepted := consumeAccessState(state, originalUser.Owner, originalUser.Name, now); accepted {
+		t.Fatal("recreated-user rejection left its one-time state replayable")
 	}
 }
