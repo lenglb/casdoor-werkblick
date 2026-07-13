@@ -711,6 +711,15 @@ func resolvePasswordSigninMethod(application *object.Application, signinMethod s
 	}
 
 	switch signinMethod {
+	case "":
+		// Older Casdoor clients omit the selector for local password login. Keep
+		// that wire format compatible, but still require password authentication
+		// to be enabled explicitly. Unlike "Password", the legacy path must not
+		// silently add LDAP fallback; this preserves the pre-hardening behavior.
+		if !application.IsPasswordEnabled() {
+			return false, false, fmt.Errorf("the login method: login with password is not enabled for the application")
+		}
+		return false, false, nil
 	case "Password":
 		if !application.IsPasswordEnabled() {
 			return false, false, fmt.Errorf("the login method: login with password is not enabled for the application")
@@ -723,7 +732,7 @@ func resolvePasswordSigninMethod(application *object.Application, signinMethod s
 		return true, false, nil
 	default:
 		// A non-empty password is a credential, not a method selector. Requiring
-		// the exact configured method prevents empty/unknown values (notably from
+		// an exact known method prevents unknown values (notably from
 		// machine-to-machine clients) from falling through to local password
 		// verification.
 		return false, false, fmt.Errorf("the login method is invalid for password authentication")

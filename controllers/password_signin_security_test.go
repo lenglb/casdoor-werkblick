@@ -28,13 +28,40 @@ func TestResolvePasswordSigninMethodFailsClosed(t *testing.T) {
 		},
 	}
 
-	for _, method := range []string{"", "password", "Unknown", "Client credentials", " Password"} {
+	for _, method := range []string{"password", "Unknown", "Client credentials", " Password"} {
 		if _, _, err := resolvePasswordSigninMethod(application, method); err == nil {
 			t.Fatalf("signin method %q unexpectedly reached password authentication", method)
 		}
 	}
 	if _, _, err := resolvePasswordSigninMethod(nil, "Password"); err == nil {
 		t.Fatal("nil application unexpectedly reached password authentication")
+	}
+}
+
+func TestResolvePasswordSigninMethodPreservesLegacyEmptySelector(t *testing.T) {
+	enabled := &object.Application{
+		SigninMethods: []*object.SigninMethod{{Name: "Password", Rule: "All"}},
+	}
+	isLdap, passwordMayUseLdap, err := resolvePasswordSigninMethod(enabled, "")
+	if err != nil || isLdap || passwordMayUseLdap {
+		t.Fatalf("legacy password flow = ldap:%v passwordMayUseLdap:%v err:%v", isLdap, passwordMayUseLdap, err)
+	}
+
+	disabled := &object.Application{
+		SigninMethods: []*object.SigninMethod{{Name: "Password", Rule: "Hide password"}},
+	}
+	if _, _, err = resolvePasswordSigninMethod(disabled, ""); err == nil {
+		t.Fatal("legacy empty selector bypassed disabled password authentication")
+	}
+
+	legacyPersisted := &object.Application{EnablePassword: true}
+	isLdap, passwordMayUseLdap, err = resolvePasswordSigninMethod(legacyPersisted, "")
+	if err != nil || isLdap || passwordMayUseLdap {
+		t.Fatalf("legacy persisted password flow = ldap:%v passwordMayUseLdap:%v err:%v", isLdap, passwordMayUseLdap, err)
+	}
+
+	if _, _, err = resolvePasswordSigninMethod(&object.Application{}, ""); err == nil {
+		t.Fatal("legacy empty selector bypassed enablePassword=false")
 	}
 }
 
