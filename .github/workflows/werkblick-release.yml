@@ -121,6 +121,24 @@ jobs:
           cache-from: type=gha,scope=werkblick-release-image
           cache-to: type=gha,mode=max,scope=werkblick-release-image
 
+      - name: Verify hardened runtime profile on both architectures
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_ref="$IMAGE@$DIGEST"
+          for platform in linux/amd64 linux/arm64; do
+            profile="$(docker run --rm \
+              --platform "$platform" \
+              --env WERKBLICK_RUNTIME_PROFILE_ONLY=true \
+              "$image_ref")"
+            if [[ "$profile" != "werkblick-hardened-v1" ]]; then
+              echo "::error::Unexpected runtime profile '$profile' for $platform"
+              exit 1
+            fi
+          done
+
       - name: Generate SPDX SBOM from published digest
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:

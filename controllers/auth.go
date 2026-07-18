@@ -41,6 +41,8 @@ import (
 	"golang.org/x/oauth2"
 )
 
+const mfaRestartLoginMessage = "MFA session is missing or expired; restart sign-in"
+
 func codeToResponse(code *object.Code) *Response {
 	if code.Code == "" {
 		return &Response{Status: "error", Msg: code.Message, Data: code.Code}
@@ -155,6 +157,10 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 	} else if form.Type == ResponseTypeCode {
 		authenticationContext, err := c.getCurrentAuthenticationContext()
 		if err != nil {
+			if isMfaContinuationSubmission(form) {
+				c.ResponseError(mfaRestartLoginMessage)
+				return
+			}
 			c.ResponseError(fmt.Sprintf("authentication context is required: %s", err.Error()))
 			return
 		}
@@ -166,6 +172,10 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 		}
 		pending, pendingErr := c.getPendingAuthentication()
 		if pendingErr != nil {
+			if isMfaContinuationSubmission(form) {
+				c.ResponseError(mfaRestartLoginMessage)
+				return
+			}
 			c.ResponseError(fmt.Sprintf("pending authentication is required: %s", pendingErr.Error()))
 			return
 		}
@@ -216,6 +226,14 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 			resp = &Response{Status: "ok", Data: map[string]bool{"required": true}}
 			resp.Data3 = user.NeedUpdatePassword
 		} else {
+			if err = c.consumePendingAuthentication(pending.TransactionId, pending.ExpiresAt); err != nil {
+				if isMfaContinuationSubmission(form) {
+					c.ResponseError(mfaRestartLoginMessage)
+					return
+				}
+				c.ResponseError("authentication transaction is missing, expired, or already consumed")
+				return
+			}
 			code, err := object.GetOAuthCodeWithAuthenticationContext(
 				userId,
 				authorizationRequest.ClientId,
@@ -237,9 +255,6 @@ func (c *ApiController) HandleLoggedIn(application *object.Application, user *ob
 
 			resp = codeToResponse(code)
 			resp.Data3 = user.NeedUpdatePassword
-			if resp.Status == "ok" {
-				c.clearPendingAuthentication()
-			}
 		}
 	} else if form.Type == ResponseTypeToken || form.Type == ResponseTypeIdToken { // implicit flow
 		if !object.IsGrantTypeValid(form.Type, application.GrantTypes) {
@@ -1394,24 +1409,24 @@ func (c *ApiController) Login() {
 				resp = &Response{Status: "error", Msg: "Failed to link user account", Data: isLinked}
 			}
 		}
-	} else if c.getMfaUserSession() != "" {
+	} else if mfaUserId := c.getMfaUserSession(); mfaUserId != "" {
 		var user *object.User
-		user, err = object.GetUser(c.getMfaUserSession())
+		user, err = object.GetUser(mfaUserId)
 		if err != nil {
 			c.ResponseError(err.Error())
 			return
 		}
 		if user == nil {
-			c.ResponseError("expired user session")
+			c.ResponseError(mfaRestartLoginMessage)
 			return
 		}
 		pendingAuthentication, err := c.getPendingAuthentication()
 		if err != nil {
-			c.ResponseError(err.Error())
+			c.ResponseError(mfaRestartLoginMessage)
 			return
 		}
 		if pendingAuthentication.Context.Subject != user.GetId() {
-			c.ResponseError("pending authentication subject does not match MFA user")
+			c.ResponseError(mfaRestartLoginMessage)
 			return
 		}
 		if authForm.Type != pendingAuthentication.FlowType {
@@ -1596,7 +1611,11 @@ func (c *ApiController) Login() {
 
 			c.Ctx.Input.SetParam("recordUserId", user.GetId())
 		} else {
-			c.ResponseError(fmt.Sprintf(c.T("auth:Unknown authentication type (not password or provider), form = %s"), util.StructToJson(authForm)))
+			if isMfaContinuationSubmission(&authForm) {
+				c.ResponseError(mfaRestartLoginMessage)
+				return
+			}
+			c.ResponseError(unknownAuthenticationTypeMessage(c.GetAcceptLanguage(), &authForm))
 			return
 		}
 	}
@@ -1615,6 +1634,31 @@ func (c *ApiController) Login() {
 
 	c.Data["json"] = resp
 	c.ServeJSON()
+}
+
+func isMfaContinuationSubmission(authForm *form.AuthForm) bool {
+	if authForm == nil {
+		return false
+	}
+	return strings.TrimSpace(authForm.Passcode) != "" || strings.TrimSpace(authForm.RecoveryCode) != ""
+}
+
+func unknownAuthenticationTypeMessage(lang string, authForm *form.AuthForm) string {
+	safeForm := struct {
+		Type         string `json:"type"`
+		SigninMethod string `json:"signinMethod"`
+		Organization string `json:"organization"`
+		Application  string `json:"application"`
+	}{
+		Type:         authForm.Type,
+		SigninMethod: authForm.SigninMethod,
+		Organization: authForm.Organization,
+		Application:  authForm.Application,
+	}
+	return fmt.Sprintf(
+		i18n.Translate(lang, "auth:Unknown authentication type (not password or provider), form = %s"),
+		util.StructToJson(safeForm),
+	)
 }
 
 func (c *ApiController) GetSamlLogin() {

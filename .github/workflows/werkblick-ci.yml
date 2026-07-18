@@ -90,7 +90,11 @@ jobs:
         run: yarn install --frozen-lockfile --network-timeout 1000000
 
       - name: Run frontend security unit tests
-        run: node --test src/auth/ProviderState.test.mjs src/ApplicationSecurityDefaults.test.mjs
+        run: >-
+          node --test
+          src/auth/ProviderState.test.mjs
+          src/ApplicationSecurityDefaults.test.mjs
+          src/auth/mfa/MfaSubmission.test.mjs
 
       - name: Build production frontend
         env:
@@ -135,8 +139,13 @@ jobs:
           cache-from: type=gha,scope=werkblick-ci-image
           cache-to: type=gha,mode=max,scope=werkblick-ci-image
 
-      - name: Verify PostgreSQL 16 upgrade and migration-only exit
+      - name: Verify hardened profile, PostgreSQL 16 upgrade, and migration-only exit
         env:
           WERKBLICK_CI_IMAGE: casdoor-werkblick-ci:${{ github.sha }}
         shell: bash
-        run: scripts/verify-postgres-migration.sh "$WERKBLICK_CI_IMAGE"
+        run: |
+          profile="$(docker run --rm \
+            --env WERKBLICK_RUNTIME_PROFILE_ONLY=true \
+            "$WERKBLICK_CI_IMAGE")"
+          test "$profile" = "werkblick-hardened-v1"
+          scripts/verify-postgres-migration.sh "$WERKBLICK_CI_IMAGE"

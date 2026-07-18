@@ -2,11 +2,16 @@ import {CopyOutlined} from "@ant-design/icons";
 import {Button, Col, Form, Input, QRCode, Space} from "antd";
 import copy from "copy-to-clipboard";
 import i18next from "i18next";
-import React from "react";
+import React, {useRef} from "react";
 import * as Setting from "../../Setting";
+import {createOtpAutoSubmitter} from "./MfaSubmission.mjs";
 
-export const MfaVerifyTotpForm = ({mfaProps, onFinish}) => {
+export const MfaVerifyTotpForm = ({mfaProps, onFinish, loading = false}) => {
   const [form] = Form.useForm();
+  const autoSubmitPasscode = useRef(null);
+  if (autoSubmitPasscode.current === null) {
+    autoSubmitPasscode.current = createOtpAutoSubmitter(() => form.submit());
+  }
 
   const renderSecret = () => {
     if (!mfaProps.secret) {
@@ -49,15 +54,17 @@ export const MfaVerifyTotpForm = ({mfaProps, onFinish}) => {
       >
         <Input.OTP
           style={{marginTop: 24}}
-          onChange={() => {
-            form.submit();
+          disabled={loading}
+          onChange={(passcode) => {
+            autoSubmitPasscode.current(passcode, loading);
           }}
         />
       </Form.Item>
       <Form.Item>
         <Button
           style={{marginTop: 24}}
-          loading={false}
+          loading={loading}
+          disabled={loading}
           block
           type="primary"
           htmlType="submit"

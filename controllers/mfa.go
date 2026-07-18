@@ -579,6 +579,10 @@ func (c *ApiController) completeRequiredMfaOAuthCode(user *object.User, applicat
 		return
 	}
 
+	if err = c.consumePendingAuthentication(pending.TransactionId, pending.ExpiresAt); err != nil {
+		c.ResponseError(mfaRestartLoginMessage)
+		return
+	}
 	code, err := object.GetOAuthCodeWithAuthenticationContext(
 		user.GetId(), request.ClientId, pending.Context, request.ResponseType,
 		request.RedirectUri, request.Scope, request.State, request.Nonce,
@@ -594,10 +598,6 @@ func (c *ApiController) completeRequiredMfaOAuthCode(user *object.User, applicat
 			message = code.Message
 		}
 		c.ResponseError(message)
-		return
-	}
-	if err = c.clearPendingAuthentication(); err != nil {
-		c.ResponseError(err.Error())
 		return
 	}
 	if application.EnableSigninSession || application.HasPromptPage() {
