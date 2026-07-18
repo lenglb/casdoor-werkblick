@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/go/pkg/mod,sharing=locked \
         -trimpath \
         -buildvcs=false \
         -tags=netgo,osusergo \
-        -ldflags="-s -w -buildid=" \
+        -ldflags="-s -w -buildid= -X main.werkblickRuntimeProfile=werkblick-hardened-v1" \
         -o /out/root/server \
         .
 

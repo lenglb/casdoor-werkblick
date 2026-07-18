@@ -82,8 +82,10 @@ func TestWerkblickSessionConfigurationUsesRedisAndDefaultLifetime(t *testing.T) 
 func TestConfigureSessionClearsLegacyJsonOverride(t *testing.T) {
 	originalSessionConfig := web.BConfig.WebConfig.Session
 	originalJsonOverride, _ := web.AppConfig.String("sessionConfig")
+	originalRuntimeProfile := werkblickRuntimeProfile
 	t.Cleanup(func() {
 		web.BConfig.WebConfig.Session = originalSessionConfig
+		werkblickRuntimeProfile = originalRuntimeProfile
 		if err := web.AppConfig.Set("sessionConfig", originalJsonOverride); err != nil {
 			t.Errorf("restore sessionConfig: %v", err)
 		}
@@ -92,6 +94,7 @@ func TestConfigureSessionClearsLegacyJsonOverride(t *testing.T) {
 	if err := web.AppConfig.Set("sessionConfig", `{"cookieName":"casdoor_session_id","domain":".werkblick.tech"}`); err != nil {
 		t.Fatal(err)
 	}
+	werkblickRuntimeProfile = werkblickHardenedRuntimeProfile
 	t.Setenv("redisEndpoint", "redis:6379")
 	t.Setenv("sessionCookieLifeTime", "600")
 
@@ -114,6 +117,85 @@ func TestConfigureSessionClearsLegacyJsonOverride(t *testing.T) {
 	if sessionConfig.SessionCookieLifeTime != 600 || sessionConfig.SessionGCMaxLifetime != 600 {
 		t.Fatalf("configured session lifetime = (%d, %d)", sessionConfig.SessionCookieLifeTime, sessionConfig.SessionGCMaxLifetime)
 	}
+}
+
+func TestStandardRuntimeKeepsDevelopmentCookieContract(t *testing.T) {
+	originalSessionConfig := web.BConfig.WebConfig.Session
+	originalJsonOverride, _ := web.AppConfig.String("sessionConfig")
+	originalRuntimeProfile := werkblickRuntimeProfile
+	t.Cleanup(func() {
+		web.BConfig.WebConfig.Session = originalSessionConfig
+		werkblickRuntimeProfile = originalRuntimeProfile
+		if err := web.AppConfig.Set("sessionConfig", originalJsonOverride); err != nil {
+			t.Errorf("restore sessionConfig: %v", err)
+		}
+	})
+
+	if err := web.AppConfig.Set("sessionConfig", `{"cookieName":"unsafe","domain":".werkblick.tech","enableSidInHttpHeader":true}`); err != nil {
+		t.Fatal(err)
+	}
+	web.BConfig.WebConfig.Session = web.SessionConfig{
+		SessionAutoSetCookie:         false,
+		SessionDisableHTTPOnly:       true,
+		SessionEnableSidInHTTPHeader: true,
+		SessionEnableSidInURLQuery:   true,
+		SessionDomain:                ".werkblick.tech",
+		SessionCookieSameSite:        http.SameSiteNoneMode,
+	}
+	werkblickRuntimeProfile = ""
+	t.Setenv("redisEndpoint", "")
+	t.Setenv("sessionCookieLifeTime", "600")
+
+	configureSession()
+
+	jsonOverride, err := web.AppConfig.String("sessionConfig")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jsonOverride != "" {
+		t.Fatalf("legacy sessionConfig override remains active: %q", jsonOverride)
+	}
+	sessionConfig := web.BConfig.WebConfig.Session
+	if sessionConfig.SessionName != standardSessionName {
+		t.Fatalf("standard session name = %q, want %q", sessionConfig.SessionName, standardSessionName)
+	}
+	if !sessionConfig.SessionOn || !sessionConfig.SessionAutoSetCookie || sessionConfig.SessionDisableHTTPOnly {
+		t.Fatalf("standard session safety flags were not enforced: %#v", sessionConfig)
+	}
+	if sessionConfig.SessionEnableSidInHTTPHeader || sessionConfig.SessionEnableSidInURLQuery {
+		t.Fatalf("alternate SID transports remain enabled: %#v", sessionConfig)
+	}
+	if sessionConfig.SessionDomain != "" || sessionConfig.SessionCookieSameSite != http.SameSiteLaxMode {
+		t.Fatalf("standard host-only SameSite contract was not applied: %#v", sessionConfig)
+	}
+	if sessionConfig.SessionProvider != "file" || sessionConfig.SessionProviderConfig != "./tmp" {
+		t.Fatalf("standard session provider = (%q, %q)", sessionConfig.SessionProvider, sessionConfig.SessionProviderConfig)
+	}
+	if sessionConfig.SessionCookieLifeTime != 600 || sessionConfig.SessionGCMaxLifetime != 600 {
+		t.Fatalf("standard session lifetime = (%d, %d)", sessionConfig.SessionCookieLifeTime, sessionConfig.SessionGCMaxLifetime)
+	}
+}
+
+func TestRuntimeProfileRequiresExactCompiledMarker(t *testing.T) {
+	originalRuntimeProfile := werkblickRuntimeProfile
+	t.Cleanup(func() { werkblickRuntimeProfile = originalRuntimeProfile })
+
+	werkblickRuntimeProfile = ""
+	if got := resolvedRuntimeProfile(); got != "standard" {
+		t.Fatalf("default runtime profile = %q, want standard", got)
+	}
+	werkblickRuntimeProfile = werkblickHardenedRuntimeProfile
+	if got := resolvedRuntimeProfile(); got != werkblickHardenedRuntimeProfile {
+		t.Fatalf("hardened runtime profile = %q", got)
+	}
+
+	werkblickRuntimeProfile = "unexpected"
+	defer func() {
+		if recover() == nil {
+			t.Fatal("unknown compiled runtime profile did not fail closed")
+		}
+	}()
+	resolvedRuntimeProfile()
 }
 
 func TestWerkblickSessionCookieHeaderRequiresProxySecureFlag(t *testing.T) {

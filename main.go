@@ -37,11 +37,20 @@ import (
 )
 
 const (
-	schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
-	bootstrapDataOnlyEnv   = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
-	werkblickSessionName   = "__Host-casdoor_session_id"
-	defaultSessionLifetime = 3600 * 24 * 30
+	schemaMigrationOnlyEnv          = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
+	bootstrapDataOnlyEnv            = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+	runtimeProfileOnlyEnv           = "WERKBLICK_RUNTIME_PROFILE_ONLY"
+	werkblickHardenedRuntimeProfile = "werkblick-hardened-v1"
+	werkblickSessionName            = "__Host-casdoor_session_id"
+	standardSessionName             = "casdoor_session_id"
+	defaultSessionLifetime          = 3600 * 24 * 30
 )
+
+// werkblickRuntimeProfile is empty in upstream-compatible development builds.
+// Dockerfile.werkblick binds the hardened profile at link time, and CI verifies
+// the finished image before release publication. Runtime configuration cannot
+// change or disable the compiled profile.
+var werkblickRuntimeProfile string
 
 type startupMode string
 
@@ -113,6 +122,11 @@ func runStartup(migrationOnlyValue string, bootstrapOnlyValue string, hooks star
 }
 
 func main() {
+	if os.Getenv(runtimeProfileOnlyEnv) == "true" {
+		fmt.Println(resolvedRuntimeProfile())
+		return
+	}
+
 	mode, err := runStartup(os.Getenv(schemaMigrationOnlyEnv), os.Getenv(bootstrapDataOnlyEnv), startupHooks{
 		configureSession: configureSession,
 		initAPI:          routers.InitAPI,
@@ -133,23 +147,70 @@ func main() {
 	}
 }
 
+func resolvedRuntimeProfile() string {
+	switch werkblickRuntimeProfile {
+	case "":
+		return "standard"
+	case werkblickHardenedRuntimeProfile:
+		return werkblickHardenedRuntimeProfile
+	default:
+		panic(fmt.Sprintf("unsupported compiled runtime profile %q", werkblickRuntimeProfile))
+	}
+}
+
 func configureSession() {
 	sessionCookieLifeTime := defaultSessionLifetime
 	if val, err := conf.GetConfigInt64("sessionCookieLifeTime"); err == nil && val > 0 {
 		sessionCookieLifeTime = int(val)
 	}
+	redisEndpoint := conf.GetConfigString("redisEndpoint")
 
-	// Beego's JSON sessionConfig bypasses every typed field below. The
-	// Werkblick image owns this security boundary, so a mounted legacy override
-	// must not be allowed to restore a parent-domain or ambiguous cookie name.
+	// Beego's JSON sessionConfig bypasses every typed field below. Both the
+	// upstream-compatible development profile and the hardened Werkblick image
+	// own their complete cookie contract, so mounted legacy JSON must not be
+	// allowed to restore a parent-domain cookie or alternate SID transports.
 	if err := web.AppConfig.Set("sessionConfig", ""); err != nil {
 		panic(fmt.Sprintf("disable legacy sessionConfig override: %v", err))
 	}
+
+	if resolvedRuntimeProfile() == "standard" {
+		applyStandardSessionConfiguration(
+			&web.BConfig.WebConfig.Session,
+			redisEndpoint,
+			sessionCookieLifeTime,
+		)
+		return
+	}
+
 	applyWerkblickSessionConfiguration(
 		&web.BConfig.WebConfig.Session,
-		conf.GetConfigString("redisEndpoint"),
+		redisEndpoint,
 		sessionCookieLifeTime,
 	)
+}
+
+func applyStandardSessionConfiguration(sessionConfig *web.SessionConfig, redisEndpoint string, sessionCookieLifeTime int) {
+	if sessionCookieLifeTime <= 0 {
+		sessionCookieLifeTime = defaultSessionLifetime
+	}
+
+	sessionConfig.SessionOn = true
+	sessionConfig.SessionAutoSetCookie = true
+	sessionConfig.SessionDisableHTTPOnly = false
+	sessionConfig.SessionEnableSidInHTTPHeader = false
+	sessionConfig.SessionEnableSidInURLQuery = false
+	sessionConfig.SessionName = standardSessionName
+	sessionConfig.SessionDomain = ""
+	sessionConfig.SessionCookieSameSite = http.SameSiteLaxMode
+	if redisEndpoint == "" {
+		sessionConfig.SessionProvider = "file"
+		sessionConfig.SessionProviderConfig = "./tmp"
+	} else {
+		sessionConfig.SessionProvider = "redis"
+		sessionConfig.SessionProviderConfig = redisEndpoint
+	}
+	sessionConfig.SessionCookieLifeTime = sessionCookieLifeTime
+	sessionConfig.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
 }
 
 func applyWerkblickSessionConfiguration(sessionConfig *web.SessionConfig, redisEndpoint string, sessionCookieLifeTime int) {

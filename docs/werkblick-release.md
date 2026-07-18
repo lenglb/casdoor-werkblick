@@ -68,13 +68,24 @@ deployment actually uses, normally `/logs`, `/tmp`, and `/files`.
 
 ### Host-only session-cookie contract
 
-Werkblick ID uses the fixed session cookie
+The binary built by `Dockerfile.werkblick` uses the fixed session cookie
 `__Host-casdoor_session_id`. The image enforces `Path=/`, `HttpOnly`,
 `SameSite=Lax`, an empty `Domain`, and disables SID transport through query
 parameters or HTTP headers. It also ignores a legacy Beego `sessionConfig`
 JSON override so a mounted configuration cannot silently restore
 `casdoor_session_id` or a parent-domain cookie. The new name intentionally
 invalidates every pre-r3 browser session and requires users to sign in again.
+
+The repository's standard development binary intentionally retains
+`casdoor_session_id` so direct-HTTP localhost and upstream Cypress workflows
+remain usable. The hardened profile is embedded at link time by
+`Dockerfile.werkblick`, verified by container CI, and executed from the exact
+published digest for both release architectures before signing; it has no
+runtime profile override. `WERKBLICK_RUNTIME_PROFILE_ONLY=true` is a read-only
+CI introspection mode that prints the compiled profile and exits; it cannot
+change the profile. Standard builds and the root
+`docker-compose.yml` are development-only and must never be deployed on a
+public Werkblick-ID endpoint.
 
 Beego sees plain HTTP behind TLS termination and therefore omits `Secure` from
 its upstream `Set-Cookie` header. A browser rejects any `__Host-` cookie without
