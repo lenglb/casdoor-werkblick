@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-import React, {Fragment, useState} from "react";
+import React, {Fragment, useRef, useState} from "react";
 import i18next from "i18next";
 import {Button, Input} from "antd";
 import * as AuthBackend from "../AuthBackend";
@@ -22,6 +22,7 @@ import MfaVerifySmsForm from "./MfaVerifySmsForm";
 import MfaVerifyTotpForm from "./MfaVerifyTotpForm";
 import MfaVerifyRadiusForm from "./MfaVerifyRadiusForm";
 import MfaVerifyPushForm from "./MfaVerifyPushForm";
+import {createSubmissionGuard} from "./MfaSubmission.mjs";
 
 export const NextMfa = "NextMfa";
 export const RequiredMfa = "RequiredMfa";
@@ -32,8 +33,12 @@ export function MfaAuthVerifyForm({formValues, authParams, mfaProps, application
   const [loading, setLoading] = useState(false);
   const [mfaType, setMfaType] = useState(mfaProps.mfaType);
   const [recoveryCode, setRecoveryCode] = useState("");
+  const submissionGuard = useRef(createSubmissionGuard());
 
   const verify = ({passcode}) => {
+    if (!submissionGuard.current.tryStart()) {
+      return;
+    }
     setLoading(true);
     const values = {...formValues, passcode, enableMfaRemember: false};
     values["mfaType"] = mfaProps.mfaType;
@@ -47,11 +52,15 @@ export function MfaAuthVerifyForm({formValues, authParams, mfaProps, application
     }).catch((res) => {
       onFail(res.message);
     }).finally(() => {
+      submissionGuard.current.finish();
       setLoading(false);
     });
   };
 
   const recover = () => {
+    if (!submissionGuard.current.tryStart()) {
+      return;
+    }
     setLoading(true);
     const values = {...formValues, recoveryCode, enableMfaRemember: false};
     const loginFunction = formValues.type === "cas" ? AuthBackend.loginCas : AuthBackend.login;
@@ -64,6 +73,7 @@ export function MfaAuthVerifyForm({formValues, authParams, mfaProps, application
     }).catch((res) => {
       onFail(res.message);
     }).finally(() => {
+      submissionGuard.current.finish();
       setLoading(false);
     });
   };
@@ -94,6 +104,7 @@ export function MfaAuthVerifyForm({formValues, authParams, mfaProps, application
             <MfaVerifyTotpForm
               mfaProps={mfaProps}
               onFinish={verify}
+              loading={loading}
             />
           </Fragment>
         ) : mfaProps.mfaType === PushMfaType ? (

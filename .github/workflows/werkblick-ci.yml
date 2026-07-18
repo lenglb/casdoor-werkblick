@@ -90,7 +90,11 @@ jobs:
         run: yarn install --frozen-lockfile --network-timeout 1000000
 
       - name: Run frontend security unit tests
-        run: node --test src/auth/ProviderState.test.mjs src/ApplicationSecurityDefaults.test.mjs
+        run: >-
+          node --test
+          src/auth/ProviderState.test.mjs
+          src/ApplicationSecurityDefaults.test.mjs
+          src/auth/mfa/MfaSubmission.test.mjs
 
       - name: Build production frontend
         env:

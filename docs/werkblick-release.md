@@ -66,6 +66,136 @@ shell, package manager, application configuration, or private key. Mount
 1Password-backed secret flow. Writable storage must be limited to the paths the
 deployment actually uses, normally `/logs`, `/tmp`, and `/files`.
 
+### Host-only session-cookie contract
+
+Werkblick ID uses the fixed session cookie
+`__Host-casdoor_session_id`. The image enforces `Path=/`, `HttpOnly`,
+`SameSite=Lax`, an empty `Domain`, and disables SID transport through query
+parameters or HTTP headers. It also ignores a legacy Beego `sessionConfig`
+JSON override so a mounted configuration cannot silently restore
+`casdoor_session_id` or a parent-domain cookie. The new name intentionally
+invalidates every pre-r3 browser session and requires users to sign in again.
+
+Beego sees plain HTTP behind TLS termination and therefore omits `Secure` from
+its upstream `Set-Cookie` header. A browser rejects any `__Host-` cookie without
+`Secure`, so the reverse-proxy change is a mandatory, same-rollout dependency.
+For Nginx 1.19.3 or newer, add the exact cookie rule before starting the new
+image:
+
+```nginx
+location / {
+    proxy_pass http://casdoor:8000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+
+    # The application already emits Path=/, HttpOnly and SameSite=Lax. Keep the
+    # cookie host-only and add Secure at the TLS boundary.
+    proxy_cookie_domain off;
+    proxy_cookie_flags __Host-casdoor_session_id secure httponly samesite=lax;
+}
+```
+
+Do not configure `proxy_cookie_path` to a non-root path and do not add a
+`Domain` attribute. Validate and reload Nginx first. The rule is inert for the
+old `casdoor_session_id`, so it can safely precede the image promotion:
+
+```bash
+nginx -t
+nginx -s reload
+```
+
+After a fresh login has proved the new cookie, expire the legacy
+`casdoor_session_id` separately for the exact ID host and every known parent
+domain. For `id.demo.werkblick.tech`, keep these temporary headers in the same
+Nginx `server` block for the old cookie's maximum lifetime of 30 days:
+
+```nginx
+add_header Set-Cookie "casdoor_session_id=; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Lax" always;
+add_header Set-Cookie "casdoor_session_id=; Path=/; Domain=demo.werkblick.tech; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Lax" always;
+add_header Set-Cookie "casdoor_session_id=; Path=/; Domain=werkblick.tech; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; Secure; HttpOnly; SameSite=Lax" always;
+```
+
+For `id.endori.werkblick.tech`, replace `demo.werkblick.tech` with
+`endori.werkblick.tech`; for `id.werkblick.tech`, use only the host-only and
+`werkblick.tech` deletion lines. Merge these directives at the same Nginx
+configuration level as existing `add_header` security rules so Nginx header
+inheritance does not accidentally suppress them. Never add a `Domain` deletion
+line for `__Host-casdoor_session_id`; the prefix requires that cookie to remain
+host-only.
+
+In Compose, expose Casdoor only to the proxy network, remove a public host-port
+mapping for port 8000, and mount the Nginx file containing the rule above. No
+cookie environment variable is accepted by the image, and any old
+`sessionConfig` or `sessionDomain` entry must be removed from the mounted
+`app.conf` to keep the deployment configuration truthful. Merge this fragment
+into the existing deployment; retain Nginx's current TLS ports, certificate
+mounts, and public edge network:
+
+```yaml
+services:
+  casdoor:
+    image: ghcr.io/lenglb/casdoor-werkblick@sha256:<r3-digest>
+    expose:
+      - "8000"
+    networks:
+      - identity
+    # Keep the existing read-only app.conf and secret mounts. Do not publish
+    # 8000 and do not set sessionConfig/sessionDomain cookie overrides.
+
+  nginx:
+    image: nginx:<deployment-pinned-version-and-digest>
+    depends_on:
+      - casdoor
+    volumes:
+      - ./nginx/werkblick-id.conf:/etc/nginx/conf.d/werkblick-id.conf:ro
+    networks:
+      - identity
+
+networks:
+  identity:
+    internal: true
+```
+
+Use a fresh cookie jar after promotion and inspect the public TLS response:
+
+```bash
+curl -fsSD - -o /dev/null \
+  https://id.demo.werkblick.tech/api/get-account | \
+awk '
+  {
+    header = tolower($0)
+    if (header ~ /^set-cookie: __host-casdoor_session_id=/) {
+      found = 1
+      if (header !~ /; path=\// ||
+          header !~ /; httponly([;[:space:]]|$)/ ||
+          header !~ /; secure([;[:space:]]|$)/ ||
+          header !~ /; samesite=lax([;[:space:]]|$)/ ||
+          header ~ /; domain=/) {
+        exit 2
+      }
+    }
+  }
+  END {
+    if (!found) exit 1
+    print "Werkblick ID session cookie contract: ok"
+  }
+'
+```
+
+The check emits only the contract result, never the raw session-cookie value.
+The returned header must contain exactly the new name plus `Path=/`, `HttpOnly`,
+`Secure`, and `SameSite=Lax`, and it must not contain `Domain=`. Verify both a
+fresh password-plus-MFA login and a second login attempt from an old browser
+tab. The latter must return the stable restart-login error and must never echo
+the submitted passcode or the complete authentication form.
+
+The in-process claim closes concurrent OAuth authorization-code and consent
+continuation races only within one Casdoor process. Keep the provider at
+exactly one replica for this release. A future multi-replica rollout requires
+an atomic shared claim store; a shared session backend alone is not sufficient.
+Implicit token, SAML, and CAS artifact issuance are outside this release's
+backend exactly-once guarantee.
+
 The Werkblick fork generates a fresh built-in JWT key for a new installation
 and loads SAML signing material from the environment's database certificate.
 The image still excludes all PEM and key files as defense in depth. Existing
@@ -204,10 +334,19 @@ cosign verify-attestation \
 gh attestation verify "oci://$IMAGE" --repo lenglb/casdoor-werkblick
 ```
 
-Rollback is a configuration-only change to the last verified digest. Never
-rebuild an old tag and never roll back to a mutable version tag. Keep the prior
-digest, its signature verification result, database migration compatibility,
-and the deployment recovery check together in the rollout record.
+For r3 and later, rollback is one maintenance-gated release operation that
+restores both the last verified image digest and the exact pre-r3 reverse-proxy
+configuration hash. The proxy rollback must remove every legacy
+`casdoor_session_id` deletion header; otherwise the r2 image can issue its old
+cookie only to have the proxy expire it on the same response. Validate the
+restored Nginx configuration, promote the prior digest, then prove health and a
+fresh password-plus-MFA login before reopening traffic. The deployment harness
+must reject an r2 rollback paired with the r3 cookie-migration proxy config.
+
+Never rebuild an old tag and never roll back to a mutable version tag. Keep the
+prior digest, exact proxy-config hash, signature verification result, database
+migration compatibility, and the deployment recovery check together in the
+rollout record.
 
 ## Updating pinned dependencies
 

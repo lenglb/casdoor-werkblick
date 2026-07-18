@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 
 	"github.com/beego/beego/v2/core/logs"
@@ -38,6 +39,8 @@ import (
 const (
 	schemaMigrationOnlyEnv = "WERKBLICK_SCHEMA_MIGRATION_ONLY"
 	bootstrapDataOnlyEnv   = "WERKBLICK_BOOTSTRAP_DATA_ONLY"
+	werkblickSessionName   = "__Host-casdoor_session_id"
+	defaultSessionLifetime = 3600 * 24 * 30
 )
 
 type startupMode string
@@ -131,22 +134,49 @@ func main() {
 }
 
 func configureSession() {
-	web.BConfig.WebConfig.Session.SessionOn = true
-	web.BConfig.WebConfig.Session.SessionName = "casdoor_session_id"
-	if conf.GetConfigString("redisEndpoint") == "" {
-		web.BConfig.WebConfig.Session.SessionProvider = "file"
-		web.BConfig.WebConfig.Session.SessionProviderConfig = "./tmp"
-	} else {
-		web.BConfig.WebConfig.Session.SessionProvider = "redis"
-		web.BConfig.WebConfig.Session.SessionProviderConfig = conf.GetConfigString("redisEndpoint")
-	}
-	sessionCookieLifeTime := 3600 * 24 * 30
+	sessionCookieLifeTime := defaultSessionLifetime
 	if val, err := conf.GetConfigInt64("sessionCookieLifeTime"); err == nil && val > 0 {
 		sessionCookieLifeTime = int(val)
 	}
-	web.BConfig.WebConfig.Session.SessionCookieLifeTime = sessionCookieLifeTime
-	web.BConfig.WebConfig.Session.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
-	// web.BConfig.WebConfig.Session.SessionCookieSameSite = http.SameSiteNoneMode
+
+	// Beego's JSON sessionConfig bypasses every typed field below. The
+	// Werkblick image owns this security boundary, so a mounted legacy override
+	// must not be allowed to restore a parent-domain or ambiguous cookie name.
+	if err := web.AppConfig.Set("sessionConfig", ""); err != nil {
+		panic(fmt.Sprintf("disable legacy sessionConfig override: %v", err))
+	}
+	applyWerkblickSessionConfiguration(
+		&web.BConfig.WebConfig.Session,
+		conf.GetConfigString("redisEndpoint"),
+		sessionCookieLifeTime,
+	)
+}
+
+func applyWerkblickSessionConfiguration(sessionConfig *web.SessionConfig, redisEndpoint string, sessionCookieLifeTime int) {
+	if sessionCookieLifeTime <= 0 {
+		sessionCookieLifeTime = defaultSessionLifetime
+	}
+
+	sessionConfig.SessionOn = true
+	sessionConfig.SessionAutoSetCookie = true
+	sessionConfig.SessionDisableHTTPOnly = false
+	sessionConfig.SessionEnableSidInHTTPHeader = false
+	sessionConfig.SessionEnableSidInURLQuery = false
+	sessionConfig.SessionName = werkblickSessionName
+	sessionConfig.SessionDomain = ""
+	sessionConfig.SessionCookieSameSite = http.SameSiteLaxMode
+	if redisEndpoint == "" {
+		sessionConfig.SessionProvider = "file"
+		sessionConfig.SessionProviderConfig = "./tmp"
+	} else {
+		sessionConfig.SessionProvider = "redis"
+		sessionConfig.SessionProviderConfig = redisEndpoint
+	}
+	sessionConfig.SessionCookieLifeTime = sessionCookieLifeTime
+	sessionConfig.SessionGCMaxLifetime = int64(sessionCookieLifeTime)
+	// Beego derives Secure from the connection that reaches it and therefore
+	// omits the flag behind TLS termination. The Nginx consumer must add Secure
+	// to this exact cookie before it reaches the browser; see the release guide.
 }
 
 func startNormalBoot() {
